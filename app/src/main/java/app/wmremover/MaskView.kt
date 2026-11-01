@@ -27,6 +27,18 @@ class MaskView(ctx: Context) : View(ctx) {
     var brushPx = 48f
     var showMask = true
     var onMaskEdited: (() -> Unit)? = null
+    var onInteract: (() -> Unit)? = null
+    var sizeRing = false
+        set(v) { field = v; invalidate() }
+    private var touching = false
+    private var touchX = 0f
+    private var touchY = 0f
+    private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = 3f
+    }
+    private val ringShadow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = 0xAA000000.toInt(); strokeWidth = 7f
+    }
     private var preview: Bitmap? = null
 
     private var overlayPix = IntArray(0)
@@ -157,6 +169,13 @@ class MaskView(ctx: Context) : View(ctx) {
                 max(boxX0, boxX1) * scale + tx, max(boxY0, boxY1) * scale + ty, boxPaint
             )
         }
+        if (sizeRing) {
+            c.drawCircle(width / 2f, height / 2f, brushPx / 2f, ringShadow)
+            c.drawCircle(width / 2f, height / 2f, brushPx / 2f, ringPaint)
+        } else if (touching && tool != BOX) {
+            c.drawCircle(touchX, touchY, brushPx / 2f, ringShadow)
+            c.drawCircle(touchX, touchY, brushPx / 2f, ringPaint)
+        }
     }
 
     private fun paintCircle(cx: Float, cy: Float, r: Float, v: Byte, dirty: IntArray) {
@@ -196,6 +215,9 @@ class MaskView(ctx: Context) : View(ctx) {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 multi = false
+                onInteract?.invoke()
+                touching = true
+                touchX = e.x; touchY = e.y
                 if (preview != null) { preview = null; invalidate() }
                 snapshot = mask.copyOf()
                 strokeActive = true
@@ -204,6 +226,7 @@ class MaskView(ctx: Context) : View(ctx) {
                 else stroke(lastIx, lastIy, lastIx, lastIy)
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
+                touching = false
                 if (strokeActive && !multi) {
                     snapshot?.let { System.arraycopy(it, 0, mask, 0, mask.size); rebuildOverlay() }
                     snapshot = null
@@ -225,6 +248,7 @@ class MaskView(ctx: Context) : View(ctx) {
                         invalidate()
                     }
                 } else if (strokeActive) {
+                    touchX = e.x; touchY = e.y
                     val ix = (e.x - tx) / scale
                     val iy = (e.y - ty) / scale
                     if (tool == BOX) { boxX1 = ix; boxY1 = iy; invalidate() }
@@ -248,6 +272,7 @@ class MaskView(ctx: Context) : View(ctx) {
                 }
                 strokeActive = false
                 multi = false
+                touching = false
                 invalidate()
             }
         }

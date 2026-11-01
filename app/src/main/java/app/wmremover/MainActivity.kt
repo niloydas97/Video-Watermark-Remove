@@ -2,11 +2,19 @@ package app.wmremover
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
@@ -16,19 +24,18 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.InputType
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
+import android.view.Window
 import android.view.WindowManager
-import android.widget.ArrayAdapter
-import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.SeekBar
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -38,215 +45,578 @@ class MainActivity : Activity() {
     private val REQ_VIDEO = 11
     private val REQ_MODEL = 12
 
-    private lateinit var maskView: MaskView
-    private lateinit var status: TextView
-    private lateinit var frameSeek: SeekBar
-    private lateinit var brushSeek: SeekBar
-    private lateinit var growSeek: SeekBar
-    private lateinit var sensSeek: SeekBar
-    private lateinit var quality: Spinner
-    private lateinit var startEt: EditText
-    private lateinit var endEt: EditText
-    private lateinit var bar: ProgressBar
-    private lateinit var btnOpen: Button
-    private lateinit var btnScan: Button
-    private lateinit var btnPreview: Button
-    private lateinit var btnGo: Button
-    private lateinit var btnCancel: Button
-    private lateinit var btnDownload: Button
-    private lateinit var btnImport: Button
-    private lateinit var modelRow: LinearLayout
+    // palette
+    private val cBg = Color.parseColor("#0F1115")
+    private val cSurf = Color.parseColor("#1A1D24")
+    private val cSurf2 = Color.parseColor("#262A33")
+    private val cAcc = Color.parseColor("#4C8DFF")
+    private val cAccDim = Color.parseColor("#2A4A85")
+    private val cOk = Color.parseColor("#22C55E")
+    private val cTxt = Color.parseColor("#E8EAF0")
+    private val cMuted = Color.parseColor("#9AA1B2")
+    private val cDanger = Color.parseColor("#FF5C6C")
 
+    // screens
+    private lateinit var root: FrameLayout
+    private lateinit var emptyView: LinearLayout
+    private lateinit var editor: LinearLayout
+
+    // empty screen
+    private lateinit var modelStatus: TextView
+    private lateinit var modelButtons: LinearLayout
+
+    // editor
+    private lateinit var maskView: MaskView
+    private lateinit var chip: TextView
+    private lateinit var hintTv: TextView
+    private lateinit var titleTv: TextView
+    private lateinit var subTv: TextView
+    private lateinit var timeCur: TextView
+    private lateinit var timeTot: TextView
+    private lateinit var frameSeek: SeekBar
+    private lateinit var sizeRow: LinearLayout
+    private lateinit var eyeBtn: TextView
+    private lateinit var btnPreview: TextView
+    private lateinit var btnGo: TextView
+    private val toolBtns = ArrayList<Pair<LinearLayout, Int>>()
+
+    // busy overlay
+    private lateinit var busyOverlay: FrameLayout
+    private lateinit var busyTitle: TextView
+    private lateinit var busyPct: TextView
+    private lateinit var busyBar: ProgressBar
+    private lateinit var busyDetail: TextView
+    private lateinit var busyTip: TextView
+    private lateinit var busyCancel: TextView
+    private var busyCancelAction: (() -> Unit)? = null
+
+    // state
     private val lama = Lama()
     private val bg = Executors.newSingleThreadExecutor()
     private var uri: Uri? = null
     private var retriever: MediaMetadataRetriever? = null
     private var durationUs = 0L
+    private var curUs = 0L
     private var uw = 0
     private var uh = 0
-    private var busy = false
-    private var transcoder: Transcoder? = null
+    private var modelLoading = false
+    private var modelMsg = ""
+    private var scanCancelled = false
     private var wakeLock: PowerManager.WakeLock? = null
 
+    // settings
+    private var grow = 4
+    private var sens = 50
+    private var qualityIdx = 0
+    private var startTxt = ""
+    private var endTxt = ""
+    private val qualityNames = listOf("High", "Maximum", "Balanced")
+    private val qualityMul = listOf(1.6f, 2.5f, 1.1f)
+    private val qualityDesc = listOf(
+        "Re-encoded at 1.6x the original bitrate. Looks identical to the source.",
+        "Re-encoded at 2.5x the original bitrate. Biggest file, zero visible loss.",
+        "Re-encoded at about the original bitrate. Smaller file."
+    )
+
+    // ------------------------------------------------------------------ helpers
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun dpf(v: Int) = v * resources.displayMetrics.density
     private fun ui(f: () -> Unit) = runOnUiThread(f)
-    private fun say(s: String) = ui { status.text = s }
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
-    // ------------------------------------------------------------------ UI
-    private fun button(text: String, w: Float = 1f, click: () -> Unit): Button {
-        val b = Button(this)
-        b.text = text
-        b.isAllCaps = false
-        b.textSize = 13f
-        b.setOnClickListener { click() }
-        b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, w)
-        return b
+    private fun shape(color: Int, r: Int, stroke: Int = 0): GradientDrawable = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dpf(r)
+        if (stroke != 0) setStroke(dp(1), stroke)
     }
 
-    private fun row(vararg v: View): LinearLayout {
-        val r = LinearLayout(this)
-        r.orientation = LinearLayout.HORIZONTAL
-        r.gravity = Gravity.CENTER_VERTICAL
-        v.forEach { r.addView(it) }
-        return r
+    private fun ripple(color: Int, r: Int, stroke: Int = 0): Drawable =
+        RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), shape(color, r, stroke), null)
+
+    private fun text(t: String, sp: Float, color: Int = cTxt, bold: Boolean = false): TextView = TextView(this).apply {
+        text = t
+        textSize = sp
+        setTextColor(color)
+        if (bold) typeface = Typeface.DEFAULT_BOLD
     }
 
-    private fun label(t: String): TextView {
-        val tv = TextView(this)
-        tv.text = t
-        tv.textSize = 13f
-        tv.setPadding(dp(6), 0, dp(6), 0)
-        tv.minWidth = dp(72)
-        return tv
+    private fun lp(w: Int, h: Int, weight: Float = 0f, l: Int = 0, t: Int = 0, r: Int = 0, b: Int = 0) =
+        LinearLayout.LayoutParams(w, h, weight).apply { setMargins(dp(l), dp(t), dp(r), dp(b)) }
+
+    private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+    private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+    private fun button(t: String, bgc: Int, fg: Int = Color.WHITE, h: Int = 52, stroke: Int = 0, click: () -> Unit): TextView =
+        text(t, 15f, fg, true).apply {
+            gravity = Gravity.CENTER
+            background = ripple(bgc, 14, stroke)
+            minHeight = dp(h)
+            setPadding(dp(14), 0, dp(14), 0)
+            isClickable = true
+            setOnClickListener { click() }
+        }
+
+    private fun iconBtn(glyph: String, click: () -> Unit): TextView = text(glyph, 21f).apply {
+        gravity = Gravity.CENTER
+        background = ripple(Color.TRANSPARENT, 24)
+        isClickable = true
+        setOnClickListener { click() }
+        layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
     }
 
-    private fun seek(max: Int, value: Int, onChange: (Int) -> Unit): SeekBar {
+    private fun look(v: View, on: Boolean) { v.alpha = if (on) 1f else 0.4f }
+
+    private fun tint(s: SeekBar) {
+        s.progressTintList = ColorStateList.valueOf(cAcc)
+        s.thumbTintList = ColorStateList.valueOf(cAcc)
+        s.progressBackgroundTintList = ColorStateList.valueOf(cSurf2)
+    }
+
+    private fun fmt(us: Long): String {
+        val s = us / 1_000_000
+        return "%d:%02d".format(s / 60, s % 60)
+    }
+
+    private fun sheet(content: View): Dialog {
+        val d = Dialog(this)
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val r = dpf(24)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.background = GradientDrawable().apply { setColor(cSurf); cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f) }
+        box.setPadding(dp(20), dp(10), dp(20), dp(24))
+        val grab = View(this)
+        grab.background = shape(cSurf2, 3)
+        box.addView(grab, lp(dp(40), dp(5), 0f, 0, 0, 0, 14).also { it.gravity = Gravity.CENTER_HORIZONTAL })
+        box.addView(content)
+        val sv = ScrollView(this)
+        sv.addView(box)
+        d.setContentView(sv)
+        d.window?.apply {
+            setLayout(MATCH, WRAP)
+            setGravity(Gravity.BOTTOM)
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        }
+        return d
+    }
+
+    // ------------------------------------------------------------------ build UI
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = cBg
+        window.navigationBarColor = cBg
+        root = FrameLayout(this)
+        root.setBackgroundColor(cBg)
+        buildEmpty()
+        buildEditor()
+        buildBusy()
+        root.addView(emptyView, FrameLayout.LayoutParams(MATCH, MATCH))
+        editor.visibility = View.GONE
+        root.addView(editor, FrameLayout.LayoutParams(MATCH, MATCH))
+        root.addView(busyOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        setContentView(root)
+        if (Lama.modelPresent(this)) loadModel() else refreshModelUi()
+    }
+
+    private fun buildEmpty() {
+        emptyView = LinearLayout(this)
+        emptyView.orientation = LinearLayout.VERTICAL
+        emptyView.gravity = Gravity.CENTER
+        emptyView.setPadding(dp(28), dp(28), dp(28), dp(28))
+
+        val icon = text("🎬", 44f).apply { gravity = Gravity.CENTER; background = shape(cSurf, 36) }
+        emptyView.addView(icon, lp(dp(112), dp(112), 0f, 0, 0, 0, 24))
+        emptyView.addView(text("Remove video watermarks", 24f, cTxt, true).apply { gravity = Gravity.CENTER })
+        emptyView.addView(
+            text("AI rebuilds the area behind logos and watermarks, right on your phone. Your videos never leave the device.", 14f, cMuted)
+                .apply { gravity = Gravity.CENTER }, lp(MATCH, WRAP, 0f, 0, 10, 0, 28)
+        )
+        emptyView.addView(button("Choose video", cAcc, h = 58) { pickVideo() }, lp(MATCH, WRAP))
+
+        modelStatus = text("", 13f, cMuted).apply { gravity = Gravity.CENTER }
+        emptyView.addView(modelStatus, lp(MATCH, WRAP, 0f, 0, 22, 0, 8))
+
+        modelButtons = LinearLayout(this)
+        modelButtons.orientation = LinearLayout.VERTICAL
+        modelButtons.addView(button("Download AI model (208 MB)", cSurf2, cTxt, 48) { downloadModel() }, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+        modelButtons.addView(button("I already have the model file", Color.TRANSPARENT, cMuted, 44) { importModel() }, lp(MATCH, WRAP))
+        modelButtons.visibility = View.GONE
+        emptyView.addView(modelButtons, lp(MATCH, WRAP))
+    }
+
+    private fun buildEditor() {
+        editor = LinearLayout(this)
+        editor.orientation = LinearLayout.VERTICAL
+
+        // top bar
+        val top = LinearLayout(this)
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.setPadding(dp(4), dp(2), dp(4), dp(2))
+        top.addView(iconBtn("📂") { pickVideo() })
+        val titles = LinearLayout(this)
+        titles.orientation = LinearLayout.VERTICAL
+        titleTv = text("", 15f, cTxt, true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        subTv = text("", 11f, cMuted)
+        titles.addView(titleTv)
+        titles.addView(subTv)
+        top.addView(titles, lp(0, WRAP, 1f, 4, 0, 4, 0))
+        eyeBtn = iconBtn("👁") {
+            maskView.showMask = !maskView.showMask
+            look(eyeBtn, maskView.showMask)
+            maskView.invalidate()
+        }
+        top.addView(eyeBtn)
+        top.addView(iconBtn("⚙") { openSettings() })
+        editor.addView(top, lp(MATCH, WRAP))
+
+        // canvas
+        val canvasBox = FrameLayout(this)
+        maskView = MaskView(this)
+        canvasBox.addView(maskView, FrameLayout.LayoutParams(MATCH, MATCH))
+        chip = text("", 12f, Color.WHITE).apply {
+            background = shape(0xCC000000.toInt(), 20)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            visibility = View.GONE
+        }
+        canvasBox.addView(chip, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(12) })
+        canvasBox.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, o: Outline) { o.setRoundRect(0, 0, v.width, v.height, dpf(18)) }
+        }
+        canvasBox.clipToOutline = true
+        maskView.onInteract = { chip.visibility = View.GONE }
+        maskView.onMaskEdited = { updateHint() }
+        editor.addView(canvasBox, lp(MATCH, 0, 1f, 10, 0, 10, 0))
+
+        // timeline
+        val tl = LinearLayout(this)
+        tl.gravity = Gravity.CENTER_VERTICAL
+        tl.setPadding(dp(10), dp(4), dp(10), 0)
+        tl.addView(text("−1s", 12f, cMuted, true).apply {
+            gravity = Gravity.CENTER; background = ripple(Color.TRANSPARENT, 18); isClickable = true
+            setOnClickListener { stepBy(-1_000_000) }
+        }, lp(dp(44), dp(40)))
+        frameSeek = SeekBar(this)
+        frameSeek.max = 1000
+        tint(frameSeek)
+        frameSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                if (fromUser) timeCur.text = fmt(durationUs * p / 1000)
+            }
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+            override fun onStopTrackingTouch(sb: SeekBar) { curUs = durationUs * sb.progress / 1000; loadFrame(curUs) }
+        })
+        tl.addView(frameSeek, lp(0, dp(40), 1f))
+        tl.addView(text("+1s", 12f, cMuted, true).apply {
+            gravity = Gravity.CENTER; background = ripple(Color.TRANSPARENT, 18); isClickable = true
+            setOnClickListener { stepBy(1_000_000) }
+        }, lp(dp(44), dp(40)))
+        editor.addView(tl, lp(MATCH, WRAP))
+        val times = LinearLayout(this)
+        times.setPadding(dp(58), 0, dp(58), 0)
+        timeCur = text("0:00", 11f, cMuted)
+        timeTot = text("0:00", 11f, cMuted).apply { gravity = Gravity.END }
+        times.addView(timeCur, lp(0, WRAP, 1f))
+        times.addView(timeTot, lp(0, WRAP, 1f))
+        editor.addView(times, lp(MATCH, WRAP))
+
+        // hint
+        hintTv = text("", 13f, cTxt).apply {
+            gravity = Gravity.CENTER
+            background = shape(cSurf, 12)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        editor.addView(hintTv, lp(MATCH, WRAP, 0f, 10, 6, 10, 6))
+
+        // brush size (only for brush / erase)
+        sizeRow = LinearLayout(this)
+        sizeRow.gravity = Gravity.CENTER_VERTICAL
+        sizeRow.setPadding(dp(16), 0, dp(16), 0)
+        sizeRow.addView(text("Size", 12f, cMuted).apply { minWidth = dp(40) })
+        val sizeSeek = SeekBar(this)
+        sizeSeek.max = 200
+        sizeSeek.progress = 48
+        tint(sizeSeek)
+        sizeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                maskView.brushPx = maxOf(10, p).toFloat()
+                if (fromUser) maskView.sizeRing = true
+            }
+            override fun onStartTrackingTouch(sb: SeekBar) { maskView.sizeRing = true }
+            override fun onStopTrackingTouch(sb: SeekBar) { maskView.sizeRing = false }
+        })
+        sizeRow.addView(sizeSeek, lp(0, dp(36), 1f))
+        editor.addView(sizeRow, lp(MATCH, WRAP))
+
+        // tool dock
+        val dock = LinearLayout(this)
+        dock.background = shape(cSurf, 20)
+        dock.setPadding(dp(6), dp(6), dp(6), dp(6))
+        val dockItems = listOf(
+            Triple("🖌", "Brush", MaskView.BRUSH), Triple("▭", "Box", MaskView.BOX), Triple("⌫", "Erase", MaskView.ERASE)
+        )
+        for ((g, l, id) in dockItems) {
+            val b = toolButton(g, l) { selectTool(id) }
+            toolBtns.add(b to id)
+            dock.addView(b, lp(0, dp(58), 1f))
+        }
+        dock.addView(View(this).apply { setBackgroundColor(cSurf2) }, lp(dp(1), dp(34), 0f, 2, 0, 2, 0).also { it.gravity = Gravity.CENTER_VERTICAL })
+        dock.addView(toolButton("↶", "Undo") { maskView.undo() }, lp(0, dp(58), 1f))
+        dock.addView(toolButton("🗑", "Clear") { maskView.clearMask() }, lp(0, dp(58), 1f))
+        dock.addView(toolButton("✨", "Auto") { scan() }.also { (it.getChildAt(0) as TextView).setTextColor(cAcc) }, lp(0, dp(58), 1f))
+        editor.addView(dock, lp(MATCH, WRAP, 0f, 10, 4, 10, 8))
+
+        // actions
+        val actions = LinearLayout(this)
+        btnPreview = button("Preview", cSurf2, cTxt, 54) { preview() }
+        btnGo = button("Remove watermark", cOk, Color.WHITE, 54) { process() }
+        actions.addView(btnPreview, lp(0, WRAP, 1f, 0, 0, 8, 0))
+        actions.addView(btnGo, lp(0, WRAP, 2f))
+        editor.addView(actions, lp(MATCH, WRAP, 0f, 10, 0, 10, 12))
+
+        selectTool(MaskView.BRUSH)
+    }
+
+    private fun toolButton(glyph: String, label: String, click: () -> Unit): LinearLayout {
+        val l = LinearLayout(this)
+        l.orientation = LinearLayout.VERTICAL
+        l.gravity = Gravity.CENTER
+        l.background = ripple(Color.TRANSPARENT, 14)
+        l.isClickable = true
+        l.addView(text(glyph, 20f).apply { gravity = Gravity.CENTER })
+        l.addView(text(label, 11f, cMuted).apply { gravity = Gravity.CENTER })
+        l.setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            click()
+        }
+        return l
+    }
+
+    private fun selectTool(id: Int) {
+        maskView.tool = id
+        for ((v, t) in toolBtns) v.background = ripple(if (t == id) cAccDim else Color.TRANSPARENT, 14)
+        sizeRow.visibility = if (id == MaskView.BOX) View.GONE else View.VISIBLE
+    }
+
+    private fun updateHint() {
+        val empty = maskView.isMaskEmpty()
+        hintTv.text = if (empty) "1  Tap ✨ Auto to find the logo, or paint over it"
+        else "2  Check the red area, tap Preview, then Remove"
+        look(btnPreview, !empty)
+        look(btnGo, !empty)
+    }
+
+    private fun showChip(s: String) {
+        chip.text = s
+        chip.visibility = View.VISIBLE
+    }
+
+    private fun buildBusy() {
+        busyOverlay = FrameLayout(this)
+        busyOverlay.setBackgroundColor(0xEE0F1115.toInt())
+        busyOverlay.isClickable = true
+        busyOverlay.visibility = View.GONE
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.background = shape(cSurf, 24)
+        card.setPadding(dp(24), dp(24), dp(24), dp(20))
+        busyTitle = text("", 18f, cTxt, true)
+        busyPct = text("", 40f, cAcc, true).apply { gravity = Gravity.CENTER }
+        busyBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        busyBar.progressTintList = ColorStateList.valueOf(cAcc)
+        busyBar.indeterminateTintList = ColorStateList.valueOf(cAcc)
+        busyDetail = text("", 13f, cTxt).apply { gravity = Gravity.CENTER }
+        busyTip = text("", 12f, cMuted).apply { gravity = Gravity.CENTER }
+        busyCancel = button("Cancel", Color.TRANSPARENT, cDanger, 48, cDanger) {
+            confirmCancel()
+        }
+        card.addView(busyTitle, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+        card.addView(busyPct, lp(MATCH, WRAP, 0f, 0, 4, 0, 4))
+        card.addView(busyBar, lp(MATCH, dp(12), 0f, 0, 6, 0, 12))
+        card.addView(busyDetail, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
+        card.addView(busyTip, lp(MATCH, WRAP, 0f, 0, 0, 0, 16))
+        card.addView(busyCancel, lp(MATCH, WRAP))
+        busyOverlay.addView(card, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER).apply {
+            setMargins(dp(24), 0, dp(24), 0)
+        })
+    }
+
+    private fun showBusy(title: String, tip: String = "", cancel: (() -> Unit)? = null) {
+        busyTitle.text = title
+        busyTip.text = tip
+        busyDetail.text = ""
+        busyPct.visibility = View.GONE
+        busyBar.isIndeterminate = true
+        busyCancelAction = cancel
+        busyCancel.visibility = if (cancel != null) View.VISIBLE else View.GONE
+        busyOverlay.visibility = View.VISIBLE
+    }
+
+    private fun updateBusy(detail: String, done: Int = -1, total: Int = 0) {
+        busyDetail.text = detail
+        if (total > 0 && done >= 0) {
+            busyBar.isIndeterminate = false
+            busyBar.max = total
+            busyBar.progress = done
+            busyPct.visibility = View.VISIBLE
+            busyPct.text = "${done * 100 / total}%"
+        }
+    }
+
+    private fun hideBusy() {
+        busyOverlay.visibility = View.GONE
+        busyCancelAction = null
+    }
+
+    private fun confirmCancel() {
+        val a = busyCancelAction ?: return
+        AlertDialog.Builder(this)
+            .setTitle("Stop?")
+            .setMessage("Progress on this step will be lost.")
+            .setPositiveButton("Stop") { _, _ -> a() }
+            .setNegativeButton("Keep going", null)
+            .show()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (busyOverlay.visibility == View.VISIBLE) {
+            if (busyCancelAction != null) confirmCancel()
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+
+    // ------------------------------------------------------------------ settings
+    private fun seekRow(title: String, desc: String, max: Int, value: Int, label: (Int) -> String, onChange: (Int) -> Unit): LinearLayout {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        val head = LinearLayout(this)
+        head.addView(text(title, 15f, cTxt, true), lp(0, WRAP, 1f))
+        val v = text(label(value), 14f, cAcc, true)
+        head.addView(v)
+        c.addView(head)
+        c.addView(text(desc, 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 2, 0, 0))
         val s = SeekBar(this)
         s.max = max
         s.progress = value
-        s.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        tint(s)
         s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { onChange(p) }
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { v.text = label(p); onChange(p) }
             override fun onStartTrackingTouch(sb: SeekBar) {}
             override fun onStopTrackingTouch(sb: SeekBar) {}
         })
-        return s
+        c.addView(s, lp(MATCH, dp(40), 0f, 0, 4, 0, 0))
+        return c
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        window.statusBarColor = Color.parseColor("#15171C")
-        window.navigationBarColor = Color.parseColor("#15171C")
+    private fun openSettings() {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.addView(text("Settings", 20f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 0, 0, 14))
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#15171C"))
+        c.addView(seekRow("Edge coverage", "Grows the marked area so soft or glowing edges are covered too.", 30, grow, { "$it px" }) { grow = it })
+        c.addView(seekRow("Auto-scan sensitivity", "Higher finds fainter logos but may flag more things.", 100, sens, { "$it%" }) { sens = it },
+            lp(MATCH, WRAP, 0f, 0, 16, 0, 0))
 
-        status = TextView(this)
-        status.setPadding(dp(10), dp(8), dp(10), dp(6))
-        status.textSize = 12f
-        status.text = "Open a video to begin."
-        root.addView(status)
-
-        maskView = MaskView(this)
-        maskView.onMaskEdited = { }
-        root.addView(maskView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-
-        frameSeek = SeekBar(this)
-        frameSeek.max = 1000
-        frameSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {}
-            override fun onStartTrackingTouch(sb: SeekBar) {}
-            override fun onStopTrackingTouch(sb: SeekBar) { loadFrame(sb.progress) }
-        })
-        root.addView(frameSeek)
-
-        val panel = LinearLayout(this)
-        panel.orientation = LinearLayout.VERTICAL
-        panel.setPadding(dp(6), 0, dp(6), dp(6))
-
-        btnOpen = button("Open video") { pickVideo() }
-        btnScan = button("Auto-scan") { scan() }
-        btnPreview = button("Preview frame") { preview() }
-        panel.addView(row(btnOpen, btnScan, btnPreview))
-
-        val rg = RadioGroup(this)
-        rg.orientation = RadioGroup.HORIZONTAL
-        rg.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f)
-        for ((i, t) in listOf("Brush", "Box", "Erase").withIndex()) {
-            val rb = RadioButton(this)
-            rb.text = t
-            rb.id = 100 + i
-            rb.textSize = 13f
-            rg.addView(rb)
+        c.addView(text("Output quality", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 8))
+        val desc = text(qualityDesc[qualityIdx], 12f, cMuted)
+        val seg = LinearLayout(this)
+        seg.background = shape(cSurf2, 14)
+        seg.setPadding(dp(4), dp(4), dp(4), dp(4))
+        val segViews = ArrayList<TextView>()
+        fun paintSeg() {
+            for ((i, tv) in segViews.withIndex()) {
+                tv.background = if (i == qualityIdx) shape(cAcc, 11) else shape(Color.TRANSPARENT, 11)
+                tv.setTextColor(if (i == qualityIdx) Color.WHITE else cMuted)
+            }
+            desc.text = qualityDesc[qualityIdx]
         }
-        rg.check(100)
-        rg.setOnCheckedChangeListener { _, id -> maskView.tool = id - 100 }
-        panel.addView(row(rg, button("Undo") { maskView.undo() }, button("Clear") { maskView.clearMask() }))
-
-        brushSeek = seek(200, 48) { maskView.brushPx = maxOf(8, it).toFloat() }
-        panel.addView(row(label("Brush"), brushSeek))
-        growSeek = seek(30, 4) { }
-        panel.addView(row(label("Mask grow"), growSeek))
-        sensSeek = seek(100, 50) { }
-        panel.addView(row(label("Scan sens."), sensSeek))
-
-        quality = Spinner(this)
-        quality.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
-            listOf("High quality (1.6x bitrate)", "Maximum (2.5x bitrate)", "Balanced (1.1x bitrate)"))
-        quality.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        panel.addView(row(label("Output"), quality))
-
-        startEt = EditText(this)
-        startEt.hint = "start s"
-        startEt.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        startEt.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        endEt = EditText(this)
-        endEt.hint = "end s (blank=all)"
-        endEt.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        endEt.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        panel.addView(row(label("Trim"), startEt, endEt))
-
-        btnGo = button("Remove watermark & save") { process() }
-        btnGo.setBackgroundColor(Color.parseColor("#1FA463"))
-        btnCancel = button("Cancel", 0.5f) { transcoder?.cancelled = true }
-        btnCancel.visibility = View.GONE
-        panel.addView(row(btnGo, btnCancel))
-
-        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
-        bar.visibility = View.GONE
-        panel.addView(bar)
-
-        btnDownload = button("Download AI model (208 MB)") { downloadModel() }
-        btnImport = button("Import model file") { importModel() }
-        modelRow = row(btnDownload, btnImport)
-        modelRow.visibility = View.GONE
-        panel.addView(modelRow)
-
-        val sv = ScrollView(this)
-        sv.addView(panel)
-        root.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(250)))
-        setContentView(root)
-
-        setBusy(true)
-        if (Lama.modelPresent(this)) loadModel() else {
-            say("The AI model is not installed yet. Download it once (Wi-Fi recommended).")
-            ui { modelRow.visibility = View.VISIBLE; setBusy(false) }
+        for ((i, n) in qualityNames.withIndex()) {
+            val tv = text(n, 14f, cMuted, true).apply {
+                gravity = Gravity.CENTER
+                minHeight = dp(42)
+                isClickable = true
+                setOnClickListener { qualityIdx = i; paintSeg() }
+            }
+            segViews.add(tv)
+            seg.addView(tv, lp(0, WRAP, 1f))
         }
-    }
+        paintSeg()
+        c.addView(seg, lp(MATCH, WRAP))
+        c.addView(desc, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
 
-    private fun setBusy(b: Boolean) {
-        busy = b
-        for (v in listOf(btnOpen, btnScan, btnPreview, btnGo, btnDownload, btnImport)) v.isEnabled = !b
+        c.addView(text("Trim (optional)", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 2))
+        c.addView(text("Process only part of the video. Try 3 seconds first to check the result.", 12f, cMuted))
+        val trim = LinearLayout(this)
+        fun field(hint: String, v: String): EditText = EditText(this).apply {
+            this.hint = hint
+            setText(v)
+            setTextColor(cTxt)
+            setHintTextColor(cMuted)
+            textSize = 15f
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            background = shape(cSurf2, 12)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        val sEt = field("Start (sec)", startTxt)
+        val eEt = field("End (sec, blank = all)", endTxt)
+        trim.addView(sEt, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        trim.addView(eEt, lp(0, WRAP, 1f, 6, 0, 0, 0))
+        c.addView(trim, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
+
+        c.addView(text("AI model", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 2))
+        c.addView(text(if (lama.loaded) "Loaded and ready ✓" else "Not loaded", 12f, if (lama.loaded) cOk else cDanger))
+        val mrow = LinearLayout(this)
+        val d = sheet(c)
+        mrow.addView(button(if (Lama.modelPresent(this)) "Re-download" else "Download (208 MB)", cSurf2, cTxt, 46) { d.dismiss(); downloadModel() }, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        mrow.addView(button("Import file", cSurf2, cTxt, 46) { d.dismiss(); importModel() }, lp(0, WRAP, 1f, 6, 0, 0, 0))
+        c.addView(mrow, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
+
+        c.addView(button("Done", cAcc, h = 52) { d.dismiss() }, lp(MATCH, WRAP, 0f, 0, 20, 0, 0))
+        d.setOnDismissListener { startTxt = sEt.text.toString(); endTxt = eEt.text.toString() }
+        d.show()
     }
 
     // ------------------------------------------------------------------ model
+    private fun refreshModelUi() {
+        modelStatus.text = when {
+            lama.loaded -> "● AI model ready"
+            modelLoading -> "● Loading AI model..."
+            modelMsg.isNotEmpty() -> "● $modelMsg"
+            else -> "● AI model not installed yet (one-time download)"
+        }
+        modelStatus.setTextColor(if (lama.loaded) cOk else cMuted)
+        modelButtons.visibility = if (!lama.loaded && !modelLoading) View.VISIBLE else View.GONE
+    }
+
     private fun loadModel() {
-        say("Loading AI model...")
+        modelLoading = true
+        refreshModelUi()
         bg.execute {
             try {
                 lama.load(this)
-                say("AI model ready. Open a video.")
-                ui { modelRow.visibility = View.GONE; setBusy(false) }
+                modelMsg = ""
             } catch (e: Throwable) {
-                say("Could not load model: ${e.message}")
-                ui { modelRow.visibility = View.VISIBLE; setBusy(false) }
+                modelMsg = "Could not load model: ${e.message}"
             }
+            modelLoading = false
+            ui { refreshModelUi() }
         }
     }
 
     private fun downloadModel() {
-        setBusy(true)
+        showBusy("Downloading AI model", "One time only, 208 MB. Wi-Fi recommended.")
         Thread {
             try {
                 lama.download(this) { done, total ->
-                    val pct = if (total > 0) (done * 100 / total).toInt() else 0
-                    say("Downloading AI model... $pct%  (${done / 1_000_000} MB)")
+                    ui { updateBusy("${done / 1_000_000} of ${total / 1_000_000} MB", (done / 1000).toInt(), maxOf(1, (total / 1000).toInt())) }
                 }
+                ui { hideBusy(); toast("Model downloaded") }
                 loadModel()
             } catch (e: Throwable) {
-                say("Download failed: ${e.message}. Try again, or use Import model file.")
-                ui { setBusy(false) }
+                modelMsg = "Download failed: ${e.message}"
+                ui { hideBusy(); refreshModelUi(); toast("Download failed. Check your connection and try again.") }
             }
         }.start()
     }
@@ -269,23 +639,32 @@ class MainActivity : Activity() {
         if (resultCode != RESULT_OK) return
         if (requestCode == REQ_VIDEO) openVideo(u)
         if (requestCode == REQ_MODEL) {
-            setBusy(true)
+            showBusy("Importing model", "Copying the file...")
             Thread {
                 try {
-                    say("Importing model...")
                     contentResolver.openInputStream(u)!!.use { inp ->
                         Lama.modelFile(this).outputStream().use { inp.copyTo(it) }
                     }
+                    ui { hideBusy() }
                     loadModel()
                 } catch (e: Throwable) {
-                    say("Import failed: ${e.message}")
-                    ui { setBusy(false) }
+                    modelMsg = "Import failed: ${e.message}"
+                    ui { hideBusy(); refreshModelUi(); toast("Import failed") }
                 }
             }.start()
         }
     }
 
+    private fun displayName(u: Uri): String {
+        contentResolver.query(u, null, null, null, null)?.use { c ->
+            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (i >= 0 && c.moveToFirst()) return c.getString(i).substringBeforeLast('.')
+        }
+        return "video"
+    }
+
     private fun openVideo(u: Uri) {
+        showBusy("Opening video")
         bg.execute {
             try {
                 retriever?.release()
@@ -295,27 +674,44 @@ class MainActivity : Activity() {
                 durationUs = (r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L) * 1000
                 val bmp = r.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: throw IllegalStateException("Could not decode this video")
+                val name = displayName(u)
                 ui {
                     uri = u
                     uw = bmp.width
                     uh = bmp.height
+                    curUs = 0
                     maskView.setVideoSize(uw, uh)
                     maskView.setFrame(bmp)
                     frameSeek.progress = 0
-                    status.text = "${uw}x${uh}, ${durationUs / 1_000_000}s.  Auto-scan, or paint over the watermark (2 fingers = zoom/pan)."
+                    titleTv.text = name
+                    subTv.text = "${uw} x ${uh}  ·  ${fmt(durationUs)}"
+                    timeCur.text = "0:00"
+                    timeTot.text = fmt(durationUs)
+                    emptyView.visibility = View.GONE
+                    editor.visibility = View.VISIBLE
+                    updateHint()
+                    showChip("Paint over the watermark · pinch to zoom · drag with 2 fingers")
+                    hideBusy()
                 }
             } catch (e: Throwable) {
-                say("Cannot open video: ${e.message}")
+                ui { hideBusy(); toast("Cannot open this video: ${e.message}") }
             }
         }
     }
 
-    private fun loadFrame(progress: Int) {
+    private fun stepBy(deltaUs: Long) {
+        if (retriever == null) return
+        curUs = (curUs + deltaUs).coerceIn(0L, maxOf(0L, durationUs - 1))
+        frameSeek.progress = if (durationUs > 0) (curUs * 1000 / durationUs).toInt() else 0
+        timeCur.text = fmt(curUs)
+        loadFrame(curUs)
+    }
+
+    private fun loadFrame(us: Long) {
         val r = retriever ?: return
         bg.execute {
             try {
-                val t = durationUs * progress / 1000
-                val bmp = r.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return@execute
+                val bmp = r.getFrameAtTime(us, MediaMetadataRetriever.OPTION_CLOSEST) ?: return@execute
                 if (bmp.width == uw && bmp.height == uh) ui { maskView.setFrame(bmp) }
             } catch (_: Throwable) {}
         }
@@ -323,41 +719,52 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ scan / preview
     private fun scan() {
-        val u = uri ?: return say("Open a video first.")
-        setBusy(true)
-        val sens = sensSeek.progress / 100f
+        val u = uri ?: return
+        scanCancelled = false
+        showBusy("Looking for logos", "Checking 24 moments of the video for things that never move.") {
+            scanCancelled = true
+            updateBusy("Stopping...")
+        }
+        val s = sens / 100f
         bg.execute {
             try {
-                val m = Detector.scan(this, u, uw, uh, sens, { a, b -> say("Scanning video... $a/$b") }, { false })
+                val m = Detector.scan(this, u, uw, uh, s, { a, b -> ui { updateBusy("Frame $a of $b", a, b) } }, { scanCancelled })
                 ui {
-                    setBusy(false)
+                    hideBusy()
+                    if (scanCancelled) return@ui
                     if (m == null || m.none { it.toInt() != 0 }) {
-                        status.text = "No static logo found. Raise sensitivity or paint it manually."
+                        showChip("Nothing found. Raise sensitivity in ⚙ or paint it by hand.")
                     } else {
                         maskView.mergeMask(m)
-                        status.text = "Scan done: red = detected. Fix with Brush / Erase if needed."
+                        showChip("Found it. Fix the red area with Brush / Erase if needed.")
                     }
                 }
             } catch (e: Throwable) {
-                ui { setBusy(false); status.text = "Scan failed: ${e.message}" }
+                ui { hideBusy(); toast("Scan failed: ${e.message}") }
             }
         }
     }
 
+    private fun needModel(): Boolean {
+        if (lama.loaded) return false
+        toast(if (modelLoading) "AI model is still loading, one moment..." else "The AI model is needed first.")
+        if (!modelLoading) openSettings()
+        return true
+    }
+
     private fun preview() {
-        val frame = maskView.frame ?: return say("Open a video first.")
-        if (maskView.isMaskEmpty()) return say("Mark the watermark first.")
-        if (!lama.loaded) return say("AI model not loaded.")
-        setBusy(true)
-        say("Running AI on this frame...")
+        val frame = maskView.frame ?: return
+        if (maskView.isMaskEmpty()) { toast("Mark the watermark first"); return }
+        if (needModel()) return
+        showBusy("Previewing this frame", "The AI is rebuilding the marked area.")
         val mask = maskView.mask.copyOf()
-        val grow = growSeek.progress
+        val g = grow
         bg.execute {
             try {
                 val t0 = System.currentTimeMillis()
                 val px = IntArray(uw * uh)
                 frame.getPixels(px, 0, uw, 0, 0, uw, uh)
-                for (rg in planRegions(mask, uw, uh, grow)) {
+                for (rg in planRegions(mask, uw, uh, g)) {
                     val side = rg.side
                     val crop = IntArray(side * side)
                     for (yy in 0 until side) System.arraycopy(px, (rg.y0 + yy) * uw + rg.x0, crop, yy * side, side)
@@ -369,43 +776,34 @@ class MainActivity : Activity() {
                 val res = Bitmap.createBitmap(px, uw, uh, Bitmap.Config.ARGB_8888)
                 val sec = (System.currentTimeMillis() - t0) / 1000.0
                 ui {
+                    hideBusy()
                     maskView.setPreview(res)
-                    setBusy(false)
-                    status.text = "Preview done in %.1fs per region-frame. Touch the image to return to editing.".format(sec)
+                    showChip("Preview · %.1fs per frame · touch to edit".format(sec))
                 }
             } catch (e: Throwable) {
-                ui { setBusy(false); status.text = "Preview failed: ${e.message}" }
+                ui { hideBusy(); toast("Preview failed: ${e.message}") }
             }
         }
     }
 
     // ------------------------------------------------------------------ process
-    private fun displayName(u: Uri): String {
-        contentResolver.query(u, null, null, null, null)?.use { c ->
-            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (i >= 0 && c.moveToFirst()) return c.getString(i).substringBeforeLast('.')
-        }
-        return "video"
-    }
-
     private fun process() {
-        val u = uri ?: return say("Open a video first.")
-        if (maskView.isMaskEmpty()) return say("Mark the watermark first.")
-        if (!lama.loaded) return say("AI model not loaded.")
-        val startUs = ((startEt.text.toString().toDoubleOrNull() ?: 0.0) * 1_000_000).toLong()
-        val endUs = ((endEt.text.toString().toDoubleOrNull() ?: 0.0) * 1_000_000).toLong()
-        val mul = when (quality.selectedItemPosition) { 1 -> 2.5f; 2 -> 1.1f; else -> 1.6f }
+        val u = uri ?: return
+        if (maskView.isMaskEmpty()) { toast("Mark the watermark first"); return }
+        if (needModel()) return
+        val startUs = ((startTxt.toDoubleOrNull() ?: 0.0) * 1_000_000).toLong()
+        val endUs = ((endTxt.toDoubleOrNull() ?: 0.0) * 1_000_000).toLong()
+        val mul = qualityMul[qualityIdx]
         val mask = maskView.mask.copyOf()
-        val grow = growSeek.progress
+        val g = grow
         val outFile = File(cacheDir, "wm_out.mp4")
-        val baseName = displayName(u)
+        val baseName = titleTv.text.toString().ifEmpty { "video" }
         val tc = Transcoder(this, lama)
-        transcoder = tc
 
-        setBusy(true)
-        btnCancel.visibility = View.VISIBLE
-        bar.visibility = View.VISIBLE
-        bar.progress = 0
+        showBusy("Removing watermark", "Keep this screen on and the app open. Long videos take a while.") {
+            tc.cancelled = true
+            updateBusy("Stopping...")
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wmremover:process").also { it.acquire(6 * 60 * 60 * 1000L) }
@@ -413,37 +811,59 @@ class MainActivity : Activity() {
         Thread {
             try {
                 outFile.delete()
-                tc.run(u, outFile.absolutePath, mask, uw, uh, grow, mul, startUs, endUs) { done, total, msPer ->
+                tc.run(u, outFile.absolutePath, mask, uw, uh, g, mul, startUs, endUs) { done, total, msPer ->
                     val etaS = (total - done) * msPer / 1000
                     ui {
-                        bar.max = total
-                        bar.progress = done
-                        status.text = "Frame $done / $total  |  %.1f s per frame  |  about %d min %d s left\nKeep this screen on and the app open."
-                            .format(msPer / 1000.0, etaS / 60, etaS % 60)
+                        updateBusy("Frame $done of $total  ·  %.1f s per frame\nabout %d min %d s left".format(msPer / 1000.0, etaS / 60, etaS % 60), done, total)
                     }
                 }
-                say("Saving to gallery...")
+                ui { updateBusy("Saving to your gallery...") }
                 val saved = saveToGallery(outFile, "${baseName}_clean.mp4")
-                ui { finishProcessing(); AlertDialog.Builder(this).setTitle("Done").setMessage("Saved to Movies/WatermarkRemover:\n$saved").setPositiveButton("OK", null).show() }
+                ui { endProcessing(); showDone(saved) }
             } catch (e: CancelledException) {
                 outFile.delete()
-                ui { finishProcessing(); status.text = "Cancelled." }
+                ui { endProcessing(); toast("Cancelled") }
             } catch (e: Throwable) {
                 outFile.delete()
-                ui { finishProcessing(); AlertDialog.Builder(this).setTitle("Failed").setMessage(e.toString()).setPositiveButton("OK", null).show() }
+                ui { endProcessing(); showError(e.toString()) }
             }
         }.start()
     }
 
-    private fun finishProcessing() {
-        btnCancel.visibility = View.GONE
-        bar.visibility = View.GONE
-        setBusy(false)
+    private fun endProcessing() {
+        hideBusy()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         wakeLock?.let { if (it.isHeld) it.release() }
     }
 
-    private fun saveToGallery(file: File, name: String): String {
+    private fun showDone(saved: Uri) {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.addView(text("Done ✓", 22f, cOk, true))
+        c.addView(text("Your cleaned video is in the gallery, in Movies / WatermarkRemover.", 14f, cMuted), lp(MATCH, WRAP, 0f, 0, 6, 0, 18))
+        val d = sheet(c)
+        val row = LinearLayout(this)
+        row.addView(button("Close", cSurf2, cTxt, 52) { d.dismiss() }, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        row.addView(button("Play", cAcc, h = 52) {
+            d.dismiss()
+            val i = Intent(Intent.ACTION_VIEW).setDataAndType(saved, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            try { startActivity(i) } catch (e: Exception) { toast("No video player found") }
+        }, lp(0, WRAP, 1f, 6, 0, 0, 0))
+        c.addView(row)
+        d.show()
+    }
+
+    private fun showError(msg: String) {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.addView(text("Something went wrong", 20f, cDanger, true))
+        c.addView(text(msg, 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 8, 0, 16))
+        val d = sheet(c)
+        c.addView(button("OK", cSurf2, cTxt, 50) { d.dismiss() })
+        d.show()
+    }
+
+    private fun saveToGallery(file: File, name: String): Uri {
         val cv = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, name)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -457,7 +877,7 @@ class MainActivity : Activity() {
         cv.put(MediaStore.Video.Media.IS_PENDING, 0)
         contentResolver.update(out, cv, null, null)
         file.delete()
-        return name
+        return out
     }
 
     override fun onDestroy() {
