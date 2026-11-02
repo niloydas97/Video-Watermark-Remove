@@ -14,20 +14,24 @@ import java.nio.ByteBuffer
 import java.nio.FloatBuffer
 import java.util.EnumSet
 
-enum class ModelKind(val file: String, val urls: List<String>, val minBytes: Long, val label: String, val mb: Int) {
+enum class ModelKind(
+    val file: String, val urls: List<String>, val minBytes: Long, val label: String, val mb: Int, val sha256: String?
+) {
     MIGAN(
         "migan_pipeline_v2.onnx",
         listOf(
+            "https://github.com/son-engr-kr/pickapicka/releases/download/models-0.2.0/migan_pipeline_v2.onnx",
             "https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx",
             "https://huggingface.co/CardAnvilModels/MI-GAN-ONNX/resolve/main/migan_pipeline_v2.onnx",
             "https://huggingface.co/edgetools/migan/resolve/main/migan_pipeline_v2.onnx"
         ),
-        40_000_000L, "Fast (MI-GAN)", 80
+        20_000_000L, "Fast (MI-GAN)", 28,
+        "6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b"
     ),
     LAMA(
         "lama_fp32.onnx",
         listOf("https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx"),
-        100_000_000L, "Detail (LaMa)", 208
+        100_000_000L, "Detail (LaMa)", 208, null
     )
 }
 
@@ -50,28 +54,57 @@ class Engine {
     val ctxMul: Float get() = if (kind == ModelKind.MIGAN) 1.6f else 1.8f
 
     fun modelFile(ctx: Context, k: ModelKind) = File(ctx.filesDir, k.file)
-    fun present(ctx: Context, k: ModelKind) = modelFile(ctx, k).let { it.exists() && it.length() > k.minBytes }
+    private fun hasAsset(ctx: Context, k: ModelKind): Boolean =
+        try { ctx.assets.list("")?.contains(k.file) == true } catch (e: Exception) { false }
+
+    fun present(ctx: Context, k: ModelKind) =
+        modelFile(ctx, k).let { it.exists() && it.length() > k.minBytes } || hasAsset(ctx, k)
+
+    /** If the model was bundled inside the APK, copy it to app storage once. */
+    private fun ensureFile(ctx: Context, k: ModelKind) {
+        val f = modelFile(ctx, k)
+        if (f.exists() && f.length() > k.minBytes) return
+        if (!hasAsset(ctx, k)) throw IOException("${k.label} model is not installed")
+        val tmp = File(f.path + ".part")
+        ctx.assets.open(k.file).use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+        f.delete()
+        tmp.renameTo(f)
+    }
 
     // ------------------------------------------------------------ download
     fun download(ctx: Context, k: ModelKind, onProgress: (Long, Long) -> Unit) {
-        var last: Exception? = null
+        val errs = ArrayList<String>()
         for (u in k.urls) {
             try {
-                downloadOne(u, modelFile(ctx, k), k.minBytes, onProgress)
+                downloadOne(u, modelFile(ctx, k), k, onProgress)
                 return
             } catch (e: Exception) {
-                last = e
+                errs.add(URL(u).host + ": " + (e.message ?: e.javaClass.simpleName))
             }
         }
-        throw last ?: IOException("Download failed")
+        throw IOException(errs.joinToString("\n"))
     }
 
-    private fun downloadOne(url: String, dst: File, minBytes: Long, onProgress: (Long, Long) -> Unit) {
+    private fun sha256Of(f: File): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { i ->
+            val buf = ByteArray(256 * 1024)
+            while (true) {
+                val n = i.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun downloadOne(url: String, dst: File, k: ModelKind, onProgress: (Long, Long) -> Unit) {
         val tmp = File(dst.path + ".part")
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 20000
         conn.readTimeout = 30000
         conn.instanceFollowRedirects = true
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) WatermarkRemover/1.0")
         if (conn.responseCode !in 200..299) throw IOException("HTTP ${conn.responseCode}")
         val total = conn.contentLengthLong
         conn.inputStream.use { input ->
@@ -87,9 +120,14 @@ class Engine {
                 }
             }
         }
-        if (tmp.length() < minBytes) throw IOException("Download incomplete")
+        if (tmp.length() < k.minBytes) { tmp.delete(); throw IOException("file too small (${tmp.length()} bytes)") }
+        val want = k.sha256
+        if (want != null && !sha256Of(tmp).equals(want, ignoreCase = true)) {
+            tmp.delete()
+            throw IOException("checksum mismatch")
+        }
         dst.delete()
-        if (!tmp.renameTo(dst)) throw IOException("Could not save model")
+        if (!tmp.renameTo(dst)) throw IOException("could not save model")
     }
 
     // ------------------------------------------------------------ sessions
@@ -122,6 +160,7 @@ class Engine {
         session = null
         kind = k
         this.accel = accel
+        ensureFile(ctx, k)
         val s = try { createSession(ctx, k, accel) } catch (e: Throwable) { createSession(ctx, k, "cpu4") }
         bind(s)
         session = s
@@ -194,6 +233,7 @@ class Engine {
         session?.close()
         session = null
         kind = k
+        ensureFile(ctx, k)
         val mask = ByteArray(640 * 640)
         for (y in 300..340) for (x in 250..380) mask[y * 640 + x] = 1
         val rg = planRegions(mask, 640, 640, 4, minSide, ctxMul)[0]

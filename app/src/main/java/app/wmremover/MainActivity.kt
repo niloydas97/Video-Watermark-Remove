@@ -249,6 +249,7 @@ class MainActivity : Activity() {
         modelButtons.orientation = LinearLayout.VERTICAL
         dlBtn = button("Download AI model", cSurf2, cTxt, 48) { downloadModel() }
         modelButtons.addView(dlBtn, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+        modelButtons.addView(button("Download in browser, then import", Color.TRANSPARENT, cMuted, 44) { openBrowserDownload() }, lp(MATCH, WRAP))
         modelButtons.addView(button("I already have the model file", Color.TRANSPARENT, cMuted, 44) { importModel() }, lp(MATCH, WRAP))
         modelButtons.visibility = View.GONE
         emptyView.addView(modelButtons, lp(MATCH, WRAP))
@@ -692,10 +693,17 @@ class MainActivity : Activity() {
                 ui { hideBusy(); toast("Model downloaded") }
                 loadModel()
             } catch (e: Throwable) {
-                modelMsg = "Download failed: ${e.message}"
-                ui { hideBusy(); refreshModelUi(); toast("Download failed. Check your connection and try again.") }
+                modelMsg = "Download failed (see details)"
+                ui {
+                    hideBusy(); refreshModelUi()
+                    showError("Model download failed.\n\n${e.message}\n\nCheck your internet, or tap \"Download in browser, then import\" and pick the saved file with \"I already have the model file\".")
+                }
             }
         }.start()
+    }
+
+    private fun openBrowserDownload() {
+        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(kind.urls[0]))) } catch (e: Exception) { toast("No browser found") }
     }
 
     private fun importModel() {
