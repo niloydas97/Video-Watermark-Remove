@@ -11,7 +11,8 @@ const val LAMA_SIZE = 512
 class Region(
     val x0: Int, val y0: Int, val side: Int,
     val alpha: FloatArray,      // side*side blend weights 0..1 (mask, feathered)
-    val mask512: FloatArray     // 512*512 binary mask for the model
+    val mask512: FloatArray,    // 512*512 binary mask for LaMa
+    val hole: ByteArray         // side*side binary hole mask (1 = pixel to rebuild)
 )
 
 class Components(val labels: IntArray, val count: Int, val bboxes: Array<IntArray>, val areas: IntArray)
@@ -119,7 +120,7 @@ private fun feather(m: ByteArray, s: Int): FloatArray {
 }
 
 /** Split the mask into separate groups (e.g. logos in two corners) and prepare a crop for each. */
-fun planRegions(mask: ByteArray, w: Int, h: Int, grow: Int): List<Region> {
+fun planRegions(mask: ByteArray, w: Int, h: Int, grow: Int, minSide: Int = 320, ctxMul: Float = 1.8f): List<Region> {
     if (mask.none { it.toInt() != 0 }) return emptyList()
     val m = Morph.dilate(mask, w, h, grow)
     val grouped = Morph.dilate(m, w, h, 20)
@@ -141,8 +142,8 @@ fun planRegions(mask: ByteArray, w: Int, h: Int, grow: Int): List<Region> {
         if (b[2] < 0) continue
         val bw = b[2] - b[0] + 1
         val bh = b[3] - b[1] + 1
-        var side = (max(bw, bh) * 1.8f).toInt()
-        side = max(side, 320)
+        var side = (max(bw, bh) * ctxMul).toInt()
+        side = max(side, minSide)
         side = min(side, min(w, h))
         side = side and 1.inv()
         val cx = (b[0] + b[2]) / 2
@@ -165,7 +166,7 @@ fun planRegions(mask: ByteArray, w: Int, h: Int, grow: Int): List<Region> {
                 m512[y * LAMA_SIZE + x] = crop[sy * side + sx].toFloat()
             }
         }
-        regions.add(Region(rx, ry, side, alpha, m512))
+        regions.add(Region(rx, ry, side, alpha, m512, crop))
     }
     return regions
 }
@@ -208,7 +209,7 @@ fun compositeAlpha(rgb: IntArray, region: Region, out512: FloatArray): IntArray 
     val plane = n * n
     val scale = n.toFloat() / side
     val res = rgb.copyOf()
-    for (y in 0 until side) {
+    java.util.stream.IntStream.range(0, side).parallel().forEach { y ->
         val sy = ((y + 0.5f) * scale - 0.5f).coerceIn(0f, (n - 1).toFloat())
         val y0 = sy.toInt()
         val y1 = min(y0 + 1, n - 1)
@@ -235,6 +236,31 @@ fun compositeAlpha(rgb: IntArray, region: Region, out512: FloatArray): IntArray 
                 px = px or (mixed.toInt().coerceIn(0, 255) shl sh)
             }
             res[y * side + x] = px
+        }
+    }
+    return res
+}
+
+/** Blend a same-resolution uint8 CHW model output (side x side) into the original crop. */
+fun compositeSame(rgb: IntArray, region: Region, out: ByteArray): IntArray {
+    val side = region.side
+    val plane = side * side
+    val res = rgb.copyOf()
+    java.util.stream.IntStream.range(0, side).parallel().forEach { y ->
+        for (x in 0 until side) {
+            val i = y * side + x
+            val a = region.alpha[i]
+            if (a <= 0.001f) continue
+            val orig = rgb[i]
+            var px = 0xFF shl 24
+            for (c in 0 until 3) {
+                val sh = 16 - 8 * c
+                val v = out[c * plane + i].toInt() and 255
+                val ov = (orig shr sh) and 255
+                val mixed = v * a + ov * (1f - a)
+                px = px or ((mixed + 0.5f).toInt().coerceIn(0, 255) shl sh)
+            }
+            res[i] = px
         }
     }
     return res

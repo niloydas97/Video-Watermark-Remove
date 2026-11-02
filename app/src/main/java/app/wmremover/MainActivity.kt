@@ -91,7 +91,13 @@ class MainActivity : Activity() {
     private var busyCancelAction: (() -> Unit)? = null
 
     // state
-    private val lama = Lama()
+    private val engine = Engine()
+    private var kind = ModelKind.MIGAN
+    private var reuse = true
+    private var tuneInfo = ""
+    private var loadingMsg = ""
+    private lateinit var dlBtn: TextView
+    private val prefs by lazy { getSharedPreferences("wm", Context.MODE_PRIVATE) }
     private val bg = Executors.newSingleThreadExecutor()
     private var uri: Uri? = null
     private var retriever: MediaMetadataRetriever? = null
@@ -215,7 +221,10 @@ class MainActivity : Activity() {
         root.addView(editor, FrameLayout.LayoutParams(MATCH, MATCH))
         root.addView(busyOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
         setContentView(root)
-        if (Lama.modelPresent(this)) loadModel() else refreshModelUi()
+        kind = try { ModelKind.valueOf(prefs.getString("kind", "MIGAN")!!) } catch (e: Exception) { ModelKind.MIGAN }
+        reuse = prefs.getBoolean("reuse", true)
+        tuneInfo = prefs.getString("tune_${kind.name}", "") ?: ""
+        if (engine.present(this, kind)) loadModel() else refreshModelUi()
     }
 
     private fun buildEmpty() {
@@ -238,7 +247,8 @@ class MainActivity : Activity() {
 
         modelButtons = LinearLayout(this)
         modelButtons.orientation = LinearLayout.VERTICAL
-        modelButtons.addView(button("Download AI model (208 MB)", cSurf2, cTxt, 48) { downloadModel() }, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+        dlBtn = button("Download AI model", cSurf2, cTxt, 48) { downloadModel() }
+        modelButtons.addView(dlBtn, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
         modelButtons.addView(button("I already have the model file", Color.TRANSPARENT, cMuted, 44) { importModel() }, lp(MATCH, WRAP))
         modelButtons.visibility = View.GONE
         emptyView.addView(modelButtons, lp(MATCH, WRAP))
@@ -519,6 +529,52 @@ class MainActivity : Activity() {
         c.addView(seekRow("Auto-scan sensitivity", "Higher finds fainter logos but may flag more things.", 100, sens, { "$it%" }) { sens = it },
             lp(MATCH, WRAP, 0f, 0, 16, 0, 0))
 
+        // --- speed / engine
+        c.addView(text("AI engine", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 8))
+        var pickedKind = kind
+        val eDesc = text("", 12f, cMuted)
+        val eSeg = LinearLayout(this)
+        eSeg.background = shape(cSurf2, 14)
+        eSeg.setPadding(dp(4), dp(4), dp(4), dp(4))
+        val eViews = ArrayList<TextView>()
+        fun paintEng() {
+            for ((i, tv) in eViews.withIndex()) {
+                val on = ModelKind.values()[i] == pickedKind
+                tv.background = if (on) shape(cAcc, 11) else shape(Color.TRANSPARENT, 11)
+                tv.setTextColor(if (on) Color.WHITE else cMuted)
+            }
+            eDesc.text = if (pickedKind == ModelKind.MIGAN)
+                "Built for phones: about 7x smaller and much faster. Great for logos and watermarks."
+            else
+                "Heavier model with finer detail on large or textured areas. Several times slower."
+        }
+        for ((i, k) in ModelKind.values().withIndex()) {
+            val tv = text(k.label, 13f, cMuted, true).apply {
+                gravity = Gravity.CENTER
+                minHeight = dp(42)
+                isClickable = true
+                setOnClickListener { pickedKind = k; paintEng() }
+            }
+            eViews.add(tv)
+            eSeg.addView(tv, lp(0, WRAP, 1f))
+        }
+        paintEng()
+        c.addView(eSeg, lp(MATCH, WRAP))
+        c.addView(eDesc, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
+
+        val reuseRow = LinearLayout(this)
+        reuseRow.gravity = Gravity.CENTER_VERTICAL
+        val reuseTxt = LinearLayout(this)
+        reuseTxt.orientation = LinearLayout.VERTICAL
+        reuseTxt.addView(text("Smart reuse", 15f, cTxt, true))
+        reuseTxt.addView(text("Skips the AI when the area around the logo has not changed (tripod shots, screen recordings). Same look, much faster, no flicker.", 12f, cMuted))
+        reuseRow.addView(reuseTxt, lp(0, WRAP, 1f, 0, 0, 12, 0))
+        val sw = android.widget.Switch(this)
+        sw.isChecked = reuse
+        sw.setOnCheckedChangeListener { _, on -> reuse = on; prefs.edit().putBoolean("reuse", on).apply() }
+        reuseRow.addView(sw)
+        c.addView(reuseRow, lp(MATCH, WRAP, 0f, 0, 18, 0, 0))
+
         c.addView(text("Output quality", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 8))
         val desc = text(qualityDesc[qualityIdx], 12f, cMuted)
         val seg = LinearLayout(this)
@@ -565,38 +621,58 @@ class MainActivity : Activity() {
         trim.addView(eEt, lp(0, WRAP, 1f, 6, 0, 0, 0))
         c.addView(trim, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
 
-        c.addView(text("AI model", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 2))
-        c.addView(text(if (lama.loaded) "Loaded and ready ✓" else "Not loaded", 12f, if (lama.loaded) cOk else cDanger))
-        val mrow = LinearLayout(this)
+        c.addView(text("Speed & model", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 2))
+        c.addView(text(
+            if (engine.loaded) "Ready ✓  ·  " + (if (tuneInfo.isNotEmpty()) "fastest mode: $tuneInfo per inference" else "mode: ${engine.accel}")
+            else "Not loaded", 12f, if (engine.loaded) cOk else cDanger))
         val d = sheet(c)
-        mrow.addView(button(if (Lama.modelPresent(this)) "Re-download" else "Download (208 MB)", cSurf2, cTxt, 46) { d.dismiss(); downloadModel() }, lp(0, WRAP, 1f, 0, 0, 6, 0))
-        mrow.addView(button("Import file", cSurf2, cTxt, 46) { d.dismiss(); importModel() }, lp(0, WRAP, 1f, 6, 0, 0, 0))
+        val mrow = LinearLayout(this)
+        mrow.addView(button("Re-run speed test", cSurf2, cTxt, 46) {
+            d.dismiss()
+            if (engine.present(this, kind)) loadModel(retune = true) else toast("Download the model first")
+        }, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        mrow.addView(button(if (engine.present(this, kind)) "Re-download" else "Download (${kind.mb} MB)", cSurf2, cTxt, 46) { d.dismiss(); downloadModel() }, lp(0, WRAP, 1f, 6, 0, 0, 0))
         c.addView(mrow, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
+        c.addView(button("Import model file", Color.TRANSPARENT, cMuted, 44) { d.dismiss(); importModel() }, lp(MATCH, WRAP, 0f, 0, 4, 0, 0))
 
         c.addView(button("Done", cAcc, h = 52) { d.dismiss() }, lp(MATCH, WRAP, 0f, 0, 20, 0, 0))
-        d.setOnDismissListener { startTxt = sEt.text.toString(); endTxt = eEt.text.toString() }
+        d.setOnDismissListener { startTxt = sEt.text.toString(); endTxt = eEt.text.toString(); switchKind(pickedKind) }
         d.show()
     }
 
     // ------------------------------------------------------------------ model
     private fun refreshModelUi() {
         modelStatus.text = when {
-            lama.loaded -> "● AI model ready"
-            modelLoading -> "● Loading AI model..."
+            engine.loaded -> "● AI ready · ${kind.label}" + (if (tuneInfo.isNotEmpty()) " · $tuneInfo" else "")
+            modelLoading -> "● $loadingMsg"
             modelMsg.isNotEmpty() -> "● $modelMsg"
-            else -> "● AI model not installed yet (one-time download)"
+            else -> "● ${kind.label} model not installed yet (one-time ${kind.mb} MB download)"
         }
-        modelStatus.setTextColor(if (lama.loaded) cOk else cMuted)
-        modelButtons.visibility = if (!lama.loaded && !modelLoading) View.VISIBLE else View.GONE
+        modelStatus.setTextColor(if (engine.loaded) cOk else cMuted)
+        dlBtn.text = "Download AI model (${kind.mb} MB)"
+        modelButtons.visibility = if (!engine.loaded && !modelLoading) View.VISIBLE else View.GONE
     }
 
-    private fun loadModel() {
+    /** Loads the current model; the first time it also tests CPU / XNNPACK / NPU and keeps the fastest. */
+    private fun loadModel(retune: Boolean = false) {
         modelLoading = true
+        loadingMsg = "Loading AI model..."
         refreshModelUi()
+        val k = kind
         bg.execute {
             try {
-                lama.load(this)
+                var accel = prefs.getString("accel_${k.name}", null)
+                if (accel == null || retune) {
+                    ui { loadingMsg = "Testing which chip is fastest on your phone (one time)..."; refreshModelUi() }
+                    val (best, ms) = engine.autoTune(this, k) { st -> ui { loadingMsg = "$st"; refreshModelUi() } }
+                    accel = best
+                    val label = when (best) { "nnapi" -> "NPU"; "xnn4" -> "XNNPACK"; "cpu6" -> "CPU x6"; else -> "CPU x4" }
+                    prefs.edit().putString("accel_${k.name}", best).putString("tune_${k.name}", "$label ${ms} ms").apply()
+                    tuneInfo = "$label ${ms} ms"
+                }
+                engine.load(this, k, accel)
                 modelMsg = ""
+                if (retune) ui { toast("Fastest mode: $tuneInfo") }
             } catch (e: Throwable) {
                 modelMsg = "Could not load model: ${e.message}"
             }
@@ -606,10 +682,11 @@ class MainActivity : Activity() {
     }
 
     private fun downloadModel() {
-        showBusy("Downloading AI model", "One time only, 208 MB. Wi-Fi recommended.")
+        val k = kind
+        showBusy("Downloading ${k.label} model", "One time only, ${k.mb} MB. Wi-Fi recommended.")
         Thread {
             try {
-                lama.download(this) { done, total ->
+                engine.download(this, k) { done, total ->
                     ui { updateBusy("${done / 1_000_000} of ${total / 1_000_000} MB", (done / 1000).toInt(), maxOf(1, (total / 1000).toInt())) }
                 }
                 ui { hideBusy(); toast("Model downloaded") }
@@ -624,6 +701,18 @@ class MainActivity : Activity() {
     private fun importModel() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE)
         startActivityForResult(i, REQ_MODEL)
+    }
+
+    private fun switchKind(k: ModelKind) {
+        if (k == kind) return
+        kind = k
+        prefs.edit().putString("kind", k.name).apply()
+        tuneInfo = prefs.getString("tune_${k.name}", "") ?: ""
+        modelMsg = ""
+        if (engine.present(this, k)) loadModel() else {
+            refreshModelUi()
+            downloadModel()
+        }
     }
 
     // ------------------------------------------------------------------ video
@@ -643,7 +732,7 @@ class MainActivity : Activity() {
             Thread {
                 try {
                     contentResolver.openInputStream(u)!!.use { inp ->
-                        Lama.modelFile(this).outputStream().use { inp.copyTo(it) }
+                        engine.modelFile(this, kind).outputStream().use { inp.copyTo(it) }
                     }
                     ui { hideBusy() }
                     loadModel()
@@ -746,7 +835,7 @@ class MainActivity : Activity() {
     }
 
     private fun needModel(): Boolean {
-        if (lama.loaded) return false
+        if (engine.loaded) return false
         toast(if (modelLoading) "AI model is still loading, one moment..." else "The AI model is needed first.")
         if (!modelLoading) openSettings()
         return true
@@ -764,11 +853,11 @@ class MainActivity : Activity() {
                 val t0 = System.currentTimeMillis()
                 val px = IntArray(uw * uh)
                 frame.getPixels(px, 0, uw, 0, 0, uw, uh)
-                for (rg in planRegions(mask, uw, uh, g)) {
+                for (rg in planRegions(mask, uw, uh, g, engine.minSide, engine.ctxMul)) {
                     val side = rg.side
                     val crop = IntArray(side * side)
                     for (yy in 0 until side) System.arraycopy(px, (rg.y0 + yy) * uw + rg.x0, crop, yy * side, side)
-                    val out = inpaintRegion(crop, rg) { a, b -> lama.infer(a, b) }
+                    val out = engine.inpaint(crop, rg)
                     for (yy in 0 until side) for (xx in 0 until side) {
                         if (rg.alpha[yy * side + xx] > 0.001f) px[(rg.y0 + yy) * uw + rg.x0 + xx] = out[yy * side + xx]
                     }
@@ -798,7 +887,8 @@ class MainActivity : Activity() {
         val g = grow
         val outFile = File(cacheDir, "wm_out.mp4")
         val baseName = titleTv.text.toString().ifEmpty { "video" }
-        val tc = Transcoder(this, lama)
+        val tc = Transcoder(this, engine)
+        val doReuse = reuse
 
         showBusy("Removing watermark", "Keep this screen on and the app open. Long videos take a while.") {
             tc.cancelled = true
@@ -811,10 +901,10 @@ class MainActivity : Activity() {
         Thread {
             try {
                 outFile.delete()
-                tc.run(u, outFile.absolutePath, mask, uw, uh, g, mul, startUs, endUs) { done, total, msPer ->
+                tc.run(u, outFile.absolutePath, mask, uw, uh, g, mul, startUs, endUs, doReuse) { done, total, msPer, reused ->
                     val etaS = (total - done) * msPer / 1000
                     ui {
-                        updateBusy("Frame $done of $total  ·  %.1f s per frame\nabout %d min %d s left".format(msPer / 1000.0, etaS / 60, etaS % 60), done, total)
+                        updateBusy("Frame $done of $total  ·  %.2f s per frame\nabout %d min %d s left\nAI ran on ${done - reused} frames · reused on $reused".format(msPer / 1000.0, etaS / 60, etaS % 60), done, total)
                     }
                 }
                 ui { updateBusy("Saving to your gallery...") }

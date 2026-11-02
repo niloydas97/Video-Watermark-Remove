@@ -20,7 +20,7 @@ class CancelledException : RuntimeException("Cancelled")
  * Untouched pixels are copied byte-for-byte from the decoder, so only the encode step costs quality
  * (use a high bitrate multiplier to keep that invisible). Audio is copied without re-encoding.
  */
-class Transcoder(private val ctx: Context, private val lama: Lama) {
+class Transcoder(private val ctx: Context, private val engine: Engine) {
     @Volatile var cancelled = false
 
     private fun fpsOf(f: MediaFormat): Float = try {
@@ -70,25 +70,31 @@ class Transcoder(private val ctx: Context, private val lama: Lama) {
         copyPlane(src.planes[2], dst.planes[2], w / 2, h / 2, cl / 2, ct / 2)
     }
 
-    private fun patch(src: Image, dst: Image, rg: Region, yuv: YuvMath) {
-        val sp = src.planes
-        val dp = dst.planes
-        val cl = src.cropRect.left
-        val ct = src.cropRect.top
-        val side = rg.side
-        val rgb = IntArray(side * side)
-        for (yy in 0 until side) {
-            val y = rg.y0 + yy
-            for (xx in 0 until side) {
-                val x = rg.x0 + xx
-                rgb[yy * side + xx] = yuv.toRgb(
-                    rd(sp[0], ct + y, cl + x),
-                    rd(sp[1], (ct + y) / 2, (cl + x) / 2),
-                    rd(sp[2], (ct + y) / 2, (cl + x) / 2)
-                )
+    /** Per-region memory used to skip the AI when the surroundings did not change. */
+    private class RegionState(val rg: Region) {
+        val sampleIdx: IntArray
+        var refLuma: ByteArray? = null
+        var refPatch: IntArray? = null
+
+        init {
+            val l = ArrayList<Int>()
+            var yy = 0
+            while (yy < rg.side) {
+                var xx = 0
+                while (xx < rg.side) {
+                    val i = yy * rg.side + xx
+                    if (rg.alpha[i] <= 0.001f) l.add(i)
+                    xx += 4
+                }
+                yy += 4
             }
+            sampleIdx = l.toIntArray()
         }
-        val out = inpaintRegion(rgb, rg) { a, b -> lama.infer(a, b) }
+    }
+
+    private fun writePatch(dst: Image, rg: Region, out: IntArray, yuv: YuvMath) {
+        val dp = dst.planes
+        val side = rg.side
         for (yy in 0 until side) {
             val y = rg.y0 + yy
             for (xx in 0 until side) {
@@ -108,10 +114,59 @@ class Transcoder(private val ctx: Context, private val lama: Lama) {
         }
     }
 
+    /** Returns true if the previous patch was reused (no AI run for this frame). */
+    private fun processRegion(src: Image, dst: Image, st: RegionState, yuv: YuvMath, reuse: Boolean): Boolean {
+        val rg = st.rg
+        val sp = src.planes
+        val cl = src.cropRect.left
+        val ct = src.cropRect.top
+        val side = rg.side
+
+        // cheap look at the unmarked surroundings (luma only, every 4th pixel)
+        val cur = ByteArray(st.sampleIdx.size)
+        for (k in cur.indices) {
+            val i = st.sampleIdx[k]
+            cur[k] = rd(sp[0], ct + rg.y0 + i / side, cl + rg.x0 + i % side).toByte()
+        }
+        val ref = st.refLuma
+        val refPatch = st.refPatch
+        if (reuse && ref != null && refPatch != null && cur.isNotEmpty()) {
+            var sum = 0L
+            var big = 0
+            for (k in cur.indices) {
+                val d = kotlin.math.abs((cur[k].toInt() and 255) - (ref[k].toInt() and 255))
+                sum += d
+                if (d > 14) big++
+            }
+            if (sum.toFloat() / cur.size <= 2.5f && big <= cur.size / 100) {
+                writePatch(dst, rg, refPatch, yuv)
+                return true
+            }
+        }
+
+        val rgb = IntArray(side * side)
+        java.util.stream.IntStream.range(0, side).parallel().forEach { yy ->
+            val y = rg.y0 + yy
+            for (xx in 0 until side) {
+                val x = rg.x0 + xx
+                rgb[yy * side + xx] = yuv.toRgb(
+                    rd(sp[0], ct + y, cl + x),
+                    rd(sp[1], (ct + y) / 2, (cl + x) / 2),
+                    rd(sp[2], (ct + y) / 2, (cl + x) / 2)
+                )
+            }
+        }
+        val out = engine.inpaint(rgb, rg)
+        writePatch(dst, rg, out, yuv)
+        st.refLuma = cur
+        st.refPatch = out
+        return false
+    }
+
     fun run(
         src: Uri, outPath: String, uprightMask: ByteArray, uw: Int, uh: Int, grow: Int,
-        bitrateMul: Float, startUs: Long, endUs: Long,
-        onProgress: (done: Int, total: Int, msPerFrame: Long) -> Unit
+        bitrateMul: Float, startUs: Long, endUs: Long, reuse: Boolean,
+        onProgress: (done: Int, total: Int, msPerFrame: Long, reused: Int) -> Unit
     ) {
         val extractor = MediaExtractor()
         extractor.setDataSource(ctx, src, null)
@@ -142,7 +197,7 @@ class Transcoder(private val ctx: Context, private val lama: Lama) {
             val t = mw; mw = mh; mh = t
         }
         m = resizeMaskNearest(m, mw, mh, W, H)
-        val regions = planRegions(m, W, H, grow)
+        val regions = planRegions(m, W, H, grow, engine.minSide, engine.ctxMul).map { RegionState(it) }
         if (regions.isEmpty()) throw IOException("Nothing is marked")
 
         val retr = MediaMetadataRetriever()
@@ -242,6 +297,7 @@ class Transcoder(private val ctx: Context, private val lama: Lama) {
             var inputEos = false
             var decoderDone = false
             var frames = 0
+            var reusedFrames = 0
             val t0 = System.currentTimeMillis()
 
             while (!decoderDone) {
@@ -271,13 +327,15 @@ class Transcoder(private val ctx: Context, private val lama: Lama) {
                         val ei = waitEncoderInput()
                         val dst = encoder.getInputImage(ei) ?: throw IOException("Encoder does not accept raw image input")
                         copyFrame(img, dst, W, H)
-                        for (rg in regions) {
+                        var allReused = true
+                        for (st in regions) {
                             if (cancelled) throw CancelledException()
-                            patch(img, dst, rg, yuv)
+                            if (!processRegion(img, dst, st, yuv, reuse)) allReused = false
                         }
+                        if (allReused) reusedFrames++
                         encoder.queueInputBuffer(ei, 0, W * H * 3 / 2, decInfo.presentationTimeUs - startUs, 0)
                         frames++
-                        onProgress(frames, maxOf(total, frames), (System.currentTimeMillis() - t0) / frames)
+                        onProgress(frames, maxOf(total, frames), (System.currentTimeMillis() - t0) / frames, reusedFrames)
                     }
                     decoder.releaseOutputBuffer(oi, false)
                     if (eos) {
