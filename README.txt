@@ -19,9 +19,11 @@ INSTALL ON THE OPPO FIND X8 PRO
    for your file manager/browser when asked.
 
 FIRST RUN
-   Tap "Download AI model (208 MB)" once (use Wi-Fi). If the download fails,
-   download lama_fp32.onnx from huggingface.co/Carve/LaMa-ONNX on any device
-   and use "Import model file".
+   The GitHub build creates the two model files (migan_gen_512.onnx and migan_gen_512_npu.onnx)
+   by itself and bundles them inside the APK: nothing to download, works offline.
+   (Android Studio route: copy both .onnx files into app/src/main/assets/ before building.)
+   Fallback: import the files by hand with "I already have the model file".
+   Import migan_gen_512.onnx first; then migan_gen_512_npu.onnx (optional, enables the NPU test).
 
 USE
    Open video -> Auto-scan (or paint with Brush / Box, Erase to fix;
@@ -29,12 +31,18 @@ USE
    Result goes to Movies/WatermarkRemover in your gallery.
    Use Trim (start/end seconds) to test on a short piece first.
 
-EXPECT IT TO BE SLOW
-   The AI runs on the phone CPU: roughly 1-4 seconds per frame per marked
-   area (the app shows a live estimate). A 10 s / 30 fps clip = 300 frames.
-   Keep the screen on and the app in the foreground. On ColorOS also set
-   Settings > Battery > Watermark Remover > allow background activity, and
-   avoid thermal throttling (no case, not charging while processing).
+SPEED (v3)
+   The model is now the bare MI-GAN neural network (tools/make_generator.py cuts it out of the
+   official pipeline file, fixes its shape and folds constants into the weights: same output,
+   ~40% less CPU work), plus an NPU-friendly build for the MediaTek NPU (NNAPI).
+   On first launch the app tests CPU / XNNPACK / NPU and keeps the fastest.
+   Settings > Speed vs exactness decides how often the AI really runs:
+     Every frame  - AI on all frames (slowest)
+     Precise      - reuse only when the surroundings are nearly identical
+     Balanced     - reuse when they barely changed (recommended)
+     Fast         - reuse through small movements
+   The progress card shows how long each AI call really takes on your phone.
+   Keep the screen on and the app open while processing.
 
 QUALITY
    Only the marked pixels are rebuilt; everything else is copied from the

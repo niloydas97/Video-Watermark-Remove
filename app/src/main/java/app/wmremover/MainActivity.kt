@@ -93,7 +93,7 @@ class MainActivity : Activity() {
     // state
     private val engine = Engine()
     private var kind = ModelKind.MIGAN
-    private var reuse = true
+    private var reuseLevel = 2
     private var tuneInfo = ""
     private var loadingMsg = ""
     private lateinit var dlBtn: TextView
@@ -222,7 +222,7 @@ class MainActivity : Activity() {
         root.addView(busyOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
         setContentView(root)
         kind = try { ModelKind.valueOf(prefs.getString("kind", "MIGAN")!!) } catch (e: Exception) { ModelKind.MIGAN }
-        reuse = prefs.getBoolean("reuse", true)
+        reuseLevel = prefs.getInt("reuse_level", if (prefs.getBoolean("reuse", true)) 2 else 0)
         tuneInfo = prefs.getString("tune_${kind.name}", "") ?: ""
         if (engine.present(this, kind)) loadModel() else refreshModelUi()
     }
@@ -563,18 +563,40 @@ class MainActivity : Activity() {
         c.addView(eSeg, lp(MATCH, WRAP))
         c.addView(eDesc, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
 
-        val reuseRow = LinearLayout(this)
-        reuseRow.gravity = Gravity.CENTER_VERTICAL
-        val reuseTxt = LinearLayout(this)
-        reuseTxt.orientation = LinearLayout.VERTICAL
-        reuseTxt.addView(text("Smart reuse", 15f, cTxt, true))
-        reuseTxt.addView(text("Skips the AI when the area around the logo has not changed (tripod shots, screen recordings). Same look, much faster, no flicker.", 12f, cMuted))
-        reuseRow.addView(reuseTxt, lp(0, WRAP, 1f, 0, 0, 12, 0))
-        val sw = android.widget.Switch(this)
-        sw.isChecked = reuse
-        sw.setOnCheckedChangeListener { _, on -> reuse = on; prefs.edit().putBoolean("reuse", on).apply() }
-        reuseRow.addView(sw)
-        c.addView(reuseRow, lp(MATCH, WRAP, 0f, 0, 18, 0, 0))
+        c.addView(text("Speed vs exactness", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 2))
+        c.addView(text("The AI only needs to run when the area around the logo changes. On still shots it can reuse its last result.", 12f, cMuted))
+        val levelNames = listOf("Every frame", "Precise", "Balanced", "Fast")
+        val levelDesc = listOf(
+            "AI runs on every single frame. Slowest, no shortcuts.",
+            "Reuses the fill only when the surroundings are nearly identical.",
+            "Reuses the fill when the surroundings barely changed. Recommended.",
+            "Reuses the fill through small movements. Fastest; a faint softness can appear in busy motion."
+        )
+        val lDesc = text("", 12f, cMuted)
+        val lSeg = LinearLayout(this)
+        lSeg.background = shape(cSurf2, 14)
+        lSeg.setPadding(dp(4), dp(4), dp(4), dp(4))
+        val lViews = ArrayList<TextView>()
+        fun paintLevel() {
+            for ((i, tv) in lViews.withIndex()) {
+                tv.background = if (i == reuseLevel) shape(cAcc, 11) else shape(Color.TRANSPARENT, 11)
+                tv.setTextColor(if (i == reuseLevel) Color.WHITE else cMuted)
+            }
+            lDesc.text = levelDesc[reuseLevel]
+        }
+        for ((i, n) in levelNames.withIndex()) {
+            val tv = text(n, 12f, cMuted, true).apply {
+                gravity = Gravity.CENTER
+                minHeight = dp(42)
+                isClickable = true
+                setOnClickListener { reuseLevel = i; prefs.edit().putInt("reuse_level", i).apply(); paintLevel() }
+            }
+            lViews.add(tv)
+            lSeg.addView(tv, lp(0, WRAP, 1f))
+        }
+        paintLevel()
+        c.addView(lSeg, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
+        c.addView(lDesc, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
 
         c.addView(text("Output quality", 15f, cTxt, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 8))
         val desc = text(qualityDesc[qualityIdx], 12f, cMuted)
@@ -632,7 +654,7 @@ class MainActivity : Activity() {
             d.dismiss()
             if (engine.present(this, kind)) loadModel(retune = true) else toast("Download the model first")
         }, lp(0, WRAP, 1f, 0, 0, 6, 0))
-        mrow.addView(button(if (engine.present(this, kind)) "Re-download" else "Download (${kind.mb} MB)", cSurf2, cTxt, 46) { d.dismiss(); downloadModel() }, lp(0, WRAP, 1f, 6, 0, 0, 0))
+        if (kind.urls.isNotEmpty()) mrow.addView(button(if (engine.present(this, kind)) "Re-download" else "Download (${kind.mb} MB)", cSurf2, cTxt, 46) { d.dismiss(); downloadModel() }, lp(0, WRAP, 1f, 6, 0, 0, 0))
         c.addView(mrow, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
         c.addView(button("Import model file", Color.TRANSPARENT, cMuted, 44) { d.dismiss(); importModel() }, lp(MATCH, WRAP, 0f, 0, 4, 0, 0))
 
@@ -647,10 +669,12 @@ class MainActivity : Activity() {
             engine.loaded -> "● AI ready · ${kind.label}" + (if (tuneInfo.isNotEmpty()) " · $tuneInfo" else "")
             modelLoading -> "● $loadingMsg"
             modelMsg.isNotEmpty() -> "● $modelMsg"
+            kind.urls.isEmpty() -> "● ${kind.label} model file missing. Use \"I already have the model file\" and pick ${kind.file}"
             else -> "● ${kind.label} model not installed yet (one-time ${kind.mb} MB download)"
         }
         modelStatus.setTextColor(if (engine.loaded) cOk else cMuted)
         dlBtn.text = "Download AI model (${kind.mb} MB)"
+        dlBtn.visibility = if (kind.urls.isEmpty()) View.GONE else View.VISIBLE
         modelButtons.visibility = if (!engine.loaded && !modelLoading) View.VISIBLE else View.GONE
     }
 
@@ -739,10 +763,16 @@ class MainActivity : Activity() {
             showBusy("Importing model", "Copying the file...")
             Thread {
                 try {
+                    val picked = displayName(u)
+                    val dstF = if (picked.contains("_npu") && kind.npuFile != null) File(filesDir, kind.npuFile!!) else engine.modelFile(this, kind)
                     contentResolver.openInputStream(u)!!.use { inp ->
-                        engine.modelFile(this, kind).outputStream().use { inp.copyTo(it) }
+                        dstF.outputStream().use { inp.copyTo(it) }
                     }
-                    ui { hideBusy() }
+                    if (dstF.length() < kind.minBytes) {
+                        dstF.delete()
+                        throw IllegalStateException("That file is too small to be the ${kind.label} model. Pick migan_pipeline_v2.onnx.")
+                    }
+                    ui { hideBusy(); toast("Model imported") }
                     loadModel()
                 } catch (e: Throwable) {
                     modelMsg = "Import failed: ${e.message}"
@@ -845,7 +875,7 @@ class MainActivity : Activity() {
     private fun needModel(): Boolean {
         if (engine.loaded) return false
         toast(if (modelLoading) "AI model is still loading, one moment..." else "The AI model is needed first.")
-        if (!modelLoading) openSettings()
+        if (!modelLoading && kind.urls.isNotEmpty()) openSettings()
         return true
     }
 
@@ -896,7 +926,7 @@ class MainActivity : Activity() {
         val outFile = File(cacheDir, "wm_out.mp4")
         val baseName = titleTv.text.toString().ifEmpty { "video" }
         val tc = Transcoder(this, engine)
-        val doReuse = reuse
+        val level = reuseLevel
 
         showBusy("Removing watermark", "Keep this screen on and the app open. Long videos take a while.") {
             tc.cancelled = true
@@ -904,15 +934,19 @@ class MainActivity : Activity() {
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        try { if (pm.isSustainedPerformanceModeSupported) window.setSustainedPerformanceMode(true) } catch (_: Throwable) {}
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wmremover:process").also { it.acquire(6 * 60 * 60 * 1000L) }
 
         Thread {
             try {
                 outFile.delete()
-                tc.run(u, outFile.absolutePath, mask, uw, uh, g, mul, startUs, endUs, doReuse) { done, total, msPer, reused ->
+                tc.run(u, outFile.absolutePath, mask, uw, uh, g, mul, startUs, endUs, level) { done, total, msPer, reused, aiMs ->
                     val etaS = (total - done) * msPer / 1000
                     ui {
-                        updateBusy("Frame $done of $total  ·  %.2f s per frame\nabout %d min %d s left\nAI ran on ${done - reused} frames · reused on $reused".format(msPer / 1000.0, etaS / 60, etaS % 60), done, total)
+                        updateBusy(
+                            "Frame $done of $total  ·  %.2f s per frame\nabout %d min %d s left\nAI ran on ${done - reused} frames (%.2f s each) · reused on $reused"
+                                .format(msPer / 1000.0, etaS / 60, etaS % 60, aiMs / 1000.0), done, total
+                        )
                     }
                 }
                 ui { updateBusy("Saving to your gallery...") }
@@ -931,6 +965,7 @@ class MainActivity : Activity() {
     private fun endProcessing() {
         hideBusy()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        try { window.setSustainedPerformanceMode(false) } catch (_: Throwable) {}
         wakeLock?.let { if (it.isHeld) it.release() }
     }
 

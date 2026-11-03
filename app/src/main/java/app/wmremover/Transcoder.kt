@@ -70,27 +70,33 @@ class Transcoder(private val ctx: Context, private val engine: Engine) {
         copyPlane(src.planes[2], dst.planes[2], w / 2, h / 2, cl / 2, ct / 2)
     }
 
-    /** Per-region memory used to skip the AI when the surroundings did not change. */
+    /** Per-region memory used to skip the AI when the area right around the logo did not change. */
     private class RegionState(val rg: Region) {
         val sampleIdx: IntArray
         var refLuma: ByteArray? = null
         var refPatch: IntArray? = null
+        var sinceAi = 0
 
         init {
+            // only the ring of pixels within ~24 px of the logo matters for what gets filled in
+            val ring = Morph.dilate(rg.hole, rg.side, rg.side, 24)
             val l = ArrayList<Int>()
             var yy = 0
             while (yy < rg.side) {
                 var xx = 0
                 while (xx < rg.side) {
                     val i = yy * rg.side + xx
-                    if (rg.alpha[i] <= 0.001f) l.add(i)
-                    xx += 4
+                    if (ring[i].toInt() != 0 && rg.alpha[i] <= 0.001f) l.add(i)
+                    xx += 2
                 }
-                yy += 4
+                yy += 2
             }
             sampleIdx = l.toIntArray()
         }
     }
+
+    private var aiNanos = 0L
+    private var aiCount = 0
 
     private fun writePatch(dst: Image, rg: Region, out: IntArray, yuv: YuvMath) {
         val dp = dst.planes
@@ -114,15 +120,15 @@ class Transcoder(private val ctx: Context, private val engine: Engine) {
         }
     }
 
-    /** Returns true if the previous patch was reused (no AI run for this frame). */
-    private fun processRegion(src: Image, dst: Image, st: RegionState, yuv: YuvMath, reuse: Boolean): Boolean {
+    /** Returns true if the previous patch was reused (no AI run for this frame). level: 0 off, 1 precise, 2 balanced, 3 fast. */
+    private fun processRegion(src: Image, dst: Image, st: RegionState, yuv: YuvMath, level: Int): Boolean {
         val rg = st.rg
         val sp = src.planes
         val cl = src.cropRect.left
         val ct = src.cropRect.top
         val side = rg.side
 
-        // cheap look at the unmarked surroundings (luma only, every 4th pixel)
+        // cheap look at the ring around the logo (luma only)
         val cur = ByteArray(st.sampleIdx.size)
         for (k in cur.indices) {
             val i = st.sampleIdx[k]
@@ -130,16 +136,38 @@ class Transcoder(private val ctx: Context, private val engine: Engine) {
         }
         val ref = st.refLuma
         val refPatch = st.refPatch
-        if (reuse && ref != null && refPatch != null && cur.isNotEmpty()) {
+        val thr = when (level) { 1 -> 1.2f; 3 -> 5f; else -> 2.5f }
+        val bigFrac = when (level) { 1 -> 0.005f; 3 -> 0.02f; else -> 0.01f }
+        val hold = when (level) { 1 -> 24; 3 -> 120; else -> 60 }
+        if (level > 0 && ref != null && refPatch != null && cur.isNotEmpty() && st.sinceAi < hold) {
             var sum = 0L
+            for (k in cur.indices) sum += (cur[k].toInt() and 255) - (ref[k].toInt() and 255)
+            val mean = sum.toFloat() / cur.size
+            var dev = 0f
             var big = 0
             for (k in cur.indices) {
-                val d = kotlin.math.abs((cur[k].toInt() and 255) - (ref[k].toInt() and 255))
-                sum += d
-                if (d > 14) big++
+                val ad = kotlin.math.abs(((cur[k].toInt() and 255) - (ref[k].toInt() and 255)) - mean)
+                dev += ad
+                if (ad > 14f) big++
             }
-            if (sum.toFloat() / cur.size <= 2.5f && big <= cur.size / 100) {
-                writePatch(dst, rg, refPatch, yuv)
+            dev /= cur.size
+            if (kotlin.math.abs(mean) <= 24f && dev <= thr && big <= cur.size * bigFrac) {
+                st.sinceAi++
+                val off = mean.roundToInt()
+                val patch = if (off == 0) refPatch else {
+                    // follow slow brightness changes (fades, auto-exposure) without re-running the AI
+                    val q = refPatch.copyOf()
+                    for (i in q.indices) {
+                        if (rg.alpha[i] <= 0.001f) continue
+                        val p = q[i]
+                        val r = (((p shr 16) and 255) + off).coerceIn(0, 255)
+                        val g = (((p shr 8) and 255) + off).coerceIn(0, 255)
+                        val b = ((p and 255) + off).coerceIn(0, 255)
+                        q[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    }
+                    q
+                }
+                writePatch(dst, rg, patch, yuv)
                 return true
             }
         }
@@ -156,18 +184,25 @@ class Transcoder(private val ctx: Context, private val engine: Engine) {
                 )
             }
         }
+        val t0 = System.nanoTime()
         val out = engine.inpaint(rgb, rg)
+        aiNanos += System.nanoTime() - t0
+        aiCount++
         writePatch(dst, rg, out, yuv)
         st.refLuma = cur
         st.refPatch = out
+        st.sinceAi = 0
         return false
     }
 
     fun run(
         src: Uri, outPath: String, uprightMask: ByteArray, uw: Int, uh: Int, grow: Int,
-        bitrateMul: Float, startUs: Long, endUs: Long, reuse: Boolean,
-        onProgress: (done: Int, total: Int, msPerFrame: Long, reused: Int) -> Unit
+        bitrateMul: Float, startUs: Long, endUs: Long, reuseLevel: Int,
+        onProgress: (done: Int, total: Int, msPerFrame: Long, reused: Int, aiMsPerCall: Long) -> Unit
     ) {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        aiNanos = 0L
+        aiCount = 0
         val extractor = MediaExtractor()
         extractor.setDataSource(ctx, src, null)
         var vIdx = -1
@@ -330,12 +365,13 @@ class Transcoder(private val ctx: Context, private val engine: Engine) {
                         var allReused = true
                         for (st in regions) {
                             if (cancelled) throw CancelledException()
-                            if (!processRegion(img, dst, st, yuv, reuse)) allReused = false
+                            if (!processRegion(img, dst, st, yuv, reuseLevel)) allReused = false
                         }
                         if (allReused) reusedFrames++
                         encoder.queueInputBuffer(ei, 0, W * H * 3 / 2, decInfo.presentationTimeUs - startUs, 0)
                         frames++
-                        onProgress(frames, maxOf(total, frames), (System.currentTimeMillis() - t0) / frames, reusedFrames)
+                        onProgress(frames, maxOf(total, frames), (System.currentTimeMillis() - t0) / frames, reusedFrames,
+                            if (aiCount > 0) aiNanos / aiCount / 1_000_000 else 0L)
                     }
                     decoder.releaseOutputBuffer(oi, false)
                     if (eos) {

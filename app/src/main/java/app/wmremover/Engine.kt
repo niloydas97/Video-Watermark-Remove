@@ -1,6 +1,5 @@
 package app.wmremover
 
-import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
@@ -15,18 +14,13 @@ import java.nio.FloatBuffer
 import java.util.EnumSet
 
 enum class ModelKind(
-    val file: String, val urls: List<String>, val minBytes: Long, val label: String, val mb: Int, val sha256: String?
+    val file: String, val urls: List<String>, val minBytes: Long, val label: String, val mb: Int, val sha256: String?,
+    val npuFile: String? = null
 ) {
     MIGAN(
-        "migan_pipeline_v2.onnx",
-        listOf(
-            "https://github.com/son-engr-kr/pickapicka/releases/download/models-0.2.0/migan_pipeline_v2.onnx",
-            "https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx",
-            "https://huggingface.co/CardAnvilModels/MI-GAN-ONNX/resolve/main/migan_pipeline_v2.onnx",
-            "https://huggingface.co/edgetools/migan/resolve/main/migan_pipeline_v2.onnx"
-        ),
-        20_000_000L, "Fast (MI-GAN)", 28,
-        "6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b"
+        "migan_gen_512.onnx",
+        emptyList(),                       // bundled in the APK (built by tools/make_generator.py) or imported
+        20_000_000L, "Fast (MI-GAN)", 28, null, "migan_gen_512_npu.onnx"
     ),
     LAMA(
         "lama_fp32.onnx",
@@ -61,7 +55,31 @@ class Engine {
         modelFile(ctx, k).let { it.exists() && it.length() > k.minBytes } || hasAsset(ctx, k)
 
     /** If the model was bundled inside the APK, copy it to app storage once. */
+    private fun ensureAlt(ctx: Context, k: ModelKind) {
+        val name = k.npuFile ?: return
+        val f = File(ctx.filesDir, name)
+        if (f.exists() && f.length() > k.minBytes) return
+        try {
+            if (ctx.assets.list("")?.contains(name) != true) return
+            val tmp = File(f.path + ".part")
+            ctx.assets.open(name).use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+            f.delete()
+            tmp.renameTo(f)
+        } catch (e: Exception) { }
+    }
+
+    /** The NPU (NNAPI) build of the model, if available; otherwise the normal one. */
+    private fun fileFor(ctx: Context, k: ModelKind, accel: String): File {
+        val name = k.npuFile
+        if (accel == "nnapi" && name != null) {
+            val f = File(ctx.filesDir, name)
+            if (f.exists() && f.length() > k.minBytes) return f
+        }
+        return modelFile(ctx, k)
+    }
+
     private fun ensureFile(ctx: Context, k: ModelKind) {
+        ensureAlt(ctx, k)
         val f = modelFile(ctx, k)
         if (f.exists() && f.length() > k.minBytes) return
         if (!hasAsset(ctx, k)) throw IOException("${k.label} model is not installed")
@@ -73,6 +91,7 @@ class Engine {
 
     // ------------------------------------------------------------ download
     fun download(ctx: Context, k: ModelKind, onProgress: (Long, Long) -> Unit) {
+        if (k.urls.isEmpty()) throw IOException("${k.label} is bundled with the app. Use Import model file with ${k.file}.")
         val errs = ArrayList<String>()
         for (u in k.urls) {
             try {
@@ -146,13 +165,13 @@ class Engine {
             }
             else -> o.setIntraOpNumThreads(4)
         }
-        return env.createSession(modelFile(ctx, k).absolutePath, o)
+        return env.createSession(fileFor(ctx, k, accel).absolutePath, o)
     }
 
     private fun bind(s: OrtSession) {
         val names = s.inputNames.toList()
         imgName = names.firstOrNull { it.contains("image", true) } ?: names[0]
-        maskName = names.firstOrNull { it.contains("mask", true) } ?: names[1]
+        maskName = names.firstOrNull { it.contains("mask", true) } ?: names.getOrNull(1) ?: names[0]
     }
 
     fun load(ctx: Context, k: ModelKind, accel: String) {
@@ -168,7 +187,7 @@ class Engine {
 
     // ------------------------------------------------------------ inference
     fun inpaint(rgb: IntArray, rg: Region): IntArray =
-        if (kind == ModelKind.LAMA) inpaintRegion(rgb, rg) { a, b -> lamaInfer(a, b) } else miganInfer(rgb, rg)
+        if (kind == ModelKind.LAMA) inpaintRegion(rgb, rg) { a, b -> lamaInfer(a, b) } else miganGenInfer(rgb, rg)
 
     private fun lamaInfer(chw: FloatArray, mask: FloatArray): FloatArray {
         val s = session ?: error("Model not loaded")
@@ -188,30 +207,30 @@ class Engine {
         }
     }
 
-    /** MI-GAN pipeline: uint8 image [1,3,H,W] + uint8 mask [1,1,H,W] (0 = hole, 255 = keep) -> uint8 result. */
-    private fun miganInfer(rgb: IntArray, rg: Region): IntArray {
+    /**
+     * MI-GAN generator (static 1x4x512x512): input = [mask-0.5, image*mask] with image in -1..1 and mask 1 = known.
+     * Output is -1..1; we resize the crop to 512 ourselves and composite the result back with a feathered alpha.
+     */
+    private fun miganGenInfer(rgb: IntArray, rg: Region): IntArray {
         val s = session ?: error("Model not loaded")
-        val side = rg.side
-        val plane = side * side
-        val img = ByteBuffer.allocateDirect(3 * plane)
+        val n = LAMA_SIZE
+        val plane = n * n
+        val chw = toChw512(rgb, rg.side)
+        val buf = ByteBuffer.allocateDirect(4 * plane * 4).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
+        for (i in 0 until plane) buf.put(i, (1f - rg.mask512[i]) - 0.5f)
         for (c in 0 until 3) {
-            val sh = 16 - 8 * c
-            for (i in 0 until plane) img.put((rgb[i] shr sh).toByte())
+            val o = (c + 1) * plane
+            for (i in 0 until plane) buf.put(o + i, (chw[c * plane + i] * 2f - 1f) * (1f - rg.mask512[i]))
         }
-        img.rewind()
-        val m = ByteBuffer.allocateDirect(plane)
-        for (i in 0 until plane) m.put(if (rg.hole[i].toInt() != 0) 0 else (-1).toByte())
-        m.rewind()
-        val sd = side.toLong()
-        OnnxTensor.createTensor(env, img, longArrayOf(1, 3, sd, sd), OnnxJavaType.UINT8).use { t1 ->
-            OnnxTensor.createTensor(env, m, longArrayOf(1, 1, sd, sd), OnnxJavaType.UINT8).use { t2 ->
-                s.run(mapOf(imgName to t1, maskName to t2)).use { res ->
-                    val bb = (res.get(0) as OnnxTensor).byteBuffer
-                    val out = ByteArray(bb.remaining())
-                    bb.get(out)
-                    if (out.size != 3 * plane) throw IOException("Unexpected model output size ${out.size}")
-                    return compositeSame(rgb, rg, out)
-                }
+        buf.rewind()
+        OnnxTensor.createTensor(env, buf, longArrayOf(1, 4, n.toLong(), n.toLong())).use { t ->
+            s.run(mapOf(imgName to t)).use { res ->
+                val fb = (res.get(0) as OnnxTensor).floatBuffer
+                val out = FloatArray(fb.remaining())
+                fb.get(out)
+                if (out.size != 3 * plane) throw IOException("Unexpected model output size ${out.size}")
+                for (i in out.indices) out[i] = ((out[i] * 0.5f + 0.5f) * 255f).coerceIn(0f, 255f)
+                return compositeAlpha(rgb, rg, out)
             }
         }
     }
